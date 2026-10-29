@@ -1,0 +1,27 @@
+# Visual Studio user and workspace state
+.vs/
+*.vcxproj.user
+*.suo
+
+# Build outputs and intermediate files
+x64/
+x86/
+Debug/
+Release/
+Win32/
+ARM/
+ARM64/
+*.obj
+*.pdb
+*.sys
+*.ilk
+*.log
+*.tlog/
+*.recipe
+
+# Signing material
+*.pfx
+*.p12
+*.key
+*.pem
+*.cer
