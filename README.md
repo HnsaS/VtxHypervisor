@@ -1,4 +1,5 @@
 # VtxHypervisor
+hwid spoofer hypervisor
 
 Hypervisor de kernel (type-2, "thin") para Windows x64 usando Intel **VT-x**.
 Ao carregar, o driver virtualiza o próprio SO em todos os cores via `VMLAUNCH`
