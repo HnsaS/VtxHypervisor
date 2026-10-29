@@ -17,6 +17,9 @@ VMCS_GUEST_RIP          EQU 0681Eh
 
 EXTERN VmExitHandler:PROC
 EXTERN VmResumeFailed:PROC
+EXTERN g_VmxStopGuestRip:QWORD
+EXTERN g_VmxStopGuestRsp:QWORD
+EXTERN g_VmxStopGuestRflags:QWORD
 
 .CODE
 
@@ -73,11 +76,31 @@ AsmVmexitHandler PROC
     push    rcx
     push    rax
 
-    mov     rcx, rsp            ; arg1 = PGUEST_REGS
+    ; Preserve volatile SIMD state because the guest can be interrupted
+    ; between arbitrary instructions and the C handler may use XMM0-XMM5.
+    sub     rsp, 60h
+    movdqu  XMMWORD PTR [rsp+00h], xmm0
+    movdqu  XMMWORD PTR [rsp+10h], xmm1
+    movdqu  XMMWORD PTR [rsp+20h], xmm2
+    movdqu  XMMWORD PTR [rsp+30h], xmm3
+    movdqu  XMMWORD PTR [rsp+40h], xmm4
+    movdqu  XMMWORD PTR [rsp+50h], xmm5
+
+    lea     rcx, [rsp+60h]      ; arg1 = PGUEST_REGS
     sub     rsp, 20h            ; shadow space
     call    VmExitHandler
     add     rsp, 20h
 
+    cmp     al, 2
+    je      _LeaveVmx
+
+    movdqu  xmm0, XMMWORD PTR [rsp+00h]
+    movdqu  xmm1, XMMWORD PTR [rsp+10h]
+    movdqu  xmm2, XMMWORD PTR [rsp+20h]
+    movdqu  xmm3, XMMWORD PTR [rsp+30h]
+    movdqu  xmm4, XMMWORD PTR [rsp+40h]
+    movdqu  xmm5, XMMWORD PTR [rsp+50h]
+    add     rsp, 60h
     test    al, al
     jz      _StopVmx
 
@@ -121,6 +144,36 @@ _StopVmx:
     pop     r15
     call    VmResumeFailed
     hlt
+
+_LeaveVmx:
+    cli
+    movdqu  xmm0, XMMWORD PTR [rsp+00h]
+    movdqu  xmm1, XMMWORD PTR [rsp+10h]
+    movdqu  xmm2, XMMWORD PTR [rsp+20h]
+    movdqu  xmm3, XMMWORD PTR [rsp+30h]
+    movdqu  xmm4, XMMWORD PTR [rsp+40h]
+    movdqu  xmm5, XMMWORD PTR [rsp+50h]
+    add     rsp, 60h
+    pop     rax
+    pop     rcx
+    pop     rdx
+    pop     rbx
+    add     rsp, 8
+    pop     rbp
+    pop     rsi
+    pop     rdi
+    pop     r8
+    pop     r9
+    pop     r10
+    pop     r11
+    pop     r12
+    pop     r13
+    pop     r14
+    pop     r15
+    mov     rsp, QWORD PTR [g_VmxStopGuestRsp]
+    push    QWORD PTR [g_VmxStopGuestRflags]
+    popfq
+    jmp     QWORD PTR [g_VmxStopGuestRip]
 AsmVmexitHandler ENDP
 
 ;------------------------------------------------------------------------------

@@ -12,61 +12,136 @@
 #include "vmx.h"
 #include <intrin.h>
 
+UINT64 g_VmxStopGuestRip;
+UINT64 g_VmxStopGuestRsp;
+UINT64 g_VmxStopGuestRflags;
+
 /* avança o RIP do guest pelo tamanho da instrução que causou o exit */
-static void VmxAdvanceGuestRip(void)
+static BOOLEAN VmxAdvanceGuestRip(void)
 {
     UINT64 rip = 0, len = 0;
-    __vmx_vmread(VMCS_GUEST_RIP, &rip);
-    __vmx_vmread(VMCS_VM_EXIT_INSTRUCTION_LEN, &len);
 
-    if (len == 0) {
-        // This should never happen, but if it does, we must 
-        // force advance or the system will hang forever.
-        len = 1;
+    if (__vmx_vmread(VMCS_GUEST_RIP, &rip) != 0) return FALSE;
+    if (__vmx_vmread(VMCS_VM_EXIT_INSTRUCTION_LEN, &len) != 0) return FALSE;
+
+    if (len == 0) return FALSE; // This is an asynchronous exit; do not advance
+
+    return (__vmx_vmwrite(VMCS_GUEST_RIP, rip + len) == 0);
+}
+
+static BOOLEAN VmxReadGuestGpr(PGUEST_REGS regs, UINT8 regIndex, UINT64* value)
+{
+    if (regIndex == 4)
+        return __vmx_vmread(VMCS_GUEST_RSP, value) == 0;
+
+    if (regIndex > 15)
+        return FALSE;
+
+    /* GUEST_REGS follows Intel's GPR encoding except RSP, stored in the VMCS. */
+    *value = *((UINT64*)((UINT8*)regs + regIndex * sizeof(UINT64)));
+    return TRUE;
+}
+
+static BOOLEAN VmxWriteGuestGpr(PGUEST_REGS regs, UINT8 regIndex, UINT64 value)
+{
+    if (regIndex == 4)
+        return __vmx_vmwrite(VMCS_GUEST_RSP, value) == 0;
+
+    if (regIndex > 15)
+        return FALSE;
+
+    *((UINT64*)((UINT8*)regs + regIndex * sizeof(UINT64))) = value;
+    return TRUE;
+}
+
+static BOOLEAN VmxReadGuestCr(UINT8 crNumber, UINT64* value)
+{
+    switch (crNumber)
+    {
+    case 0: return __vmx_vmread(VMCS_GUEST_CR0, value) == 0;
+    case 3: return __vmx_vmread(VMCS_GUEST_CR3, value) == 0;
+    case 4: return __vmx_vmread(VMCS_GUEST_CR4, value) == 0;
+    case 8: *value = __readcr8(); return TRUE;
+    default: return FALSE;
     }
+}
 
-    __vmx_vmwrite(VMCS_GUEST_RIP, rip + len);
+static BOOLEAN VmxWriteGuestCr(UINT8 crNumber, UINT64 value)
+{
+    switch (crNumber)
+    {
+    case 0:
+    {
+        UINT64 fixed0 = __readmsr(MSR_IA32_VMX_CR0_FIXED0);
+        UINT64 fixed1 = __readmsr(MSR_IA32_VMX_CR0_FIXED1);
+        if ((value & fixed0) != fixed0 || (value & ~fixed1) != 0)
+            return FALSE;
+        if (((value & (1ULL << 31)) != 0 && (value & 1) == 0) ||
+            ((value & (1ULL << 29)) != 0 && (value & (1ULL << 30)) == 0))
+            return FALSE;
+        if (__vmx_vmwrite(VMCS_GUEST_CR0, value) != 0)
+            return FALSE;
+        return __vmx_vmwrite(VMCS_CR0_READ_SHADOW, value) == 0;
+    }
+    case 3:
+        return __vmx_vmwrite(VMCS_GUEST_CR3, value) == 0;
+    case 4:
+    {
+        UINT64 fixed0 = __readmsr(MSR_IA32_VMX_CR4_FIXED0);
+        UINT64 fixed1 = __readmsr(MSR_IA32_VMX_CR4_FIXED1);
+        if ((value & fixed0) != fixed0 || (value & ~fixed1) != 0)
+            return FALSE;
+        if (__vmx_vmwrite(VMCS_GUEST_CR4, value) != 0)
+            return FALSE;
+        return __vmx_vmwrite(VMCS_CR4_READ_SHADOW, value) == 0;
+    }
+    case 8:
+        /* CR8 is shared with the physical APIC TPR; it has no VMCS field. */
+        if ((value & ~0xFULL) != 0)
+            return FALSE;
+        __writecr8(value);
+        return TRUE;
+    default:
+        return FALSE;
+    }
 }
 
 /* ---------------------------------------------------------------------------
  * VmExitHandler — chamado pelo AsmVmexitHandler a cada VM-exit.
- * Retorna TRUE  -> VMRESUME (continua a VM).
- *         FALSE -> encerra (não usado aqui; sempre continuamos).
+ * Retorna 1 -> VMRESUME, 0 -> falha fatal, 2 -> sai do VMX via VMXOFF.
  * ------------------------------------------------------------------------- */
-BOOLEAN VmExitHandler(PGUEST_REGS regs)
+UINT8 VmExitHandler(PGUEST_REGS regs)
 {
     UINT64 exitReason = 0;
     UINT16 basicReason;
 
-    __vmx_vmread(VMCS_EXIT_REASON, &exitReason);
+    if (__vmx_vmread(VMCS_EXIT_REASON, &exitReason) != 0)
+        return FALSE;
     basicReason = (UINT16)(exitReason & 0xFFFF);
 
-    /* >>> aviso de que uma VM-exit foi solicitada <<< */
-    /*DbgPrint("[Hvmx] VM-exit solicitada no core %lu (reason=%u)\n",
-             KeGetCurrentProcessorNumber(), basicReason);*/
-
-    /*
-     * Mantém a VM viva. A maioria dos exits "padrão" é de instrução
-     * (CPUID, INVD, GETSEC, XSETBV, RDMSR/WRMSR quando interceptados, etc.):
-     * reexecuta o efeito e avança o RIP.
-     */
+    // 1. Handle the "Must Advance" exits (Instructions we spoofed)
     switch (basicReason)
     {
     case EXIT_REASON_CPUID:
     {
         if (regs->rax == 0) {
-            regs->rax = 0x756e4547; // "GenU"
-            regs->rbx = 0x656e696e; // "ine "
-            regs->rcx = 0x656c7465; // "elte"
-            regs->rdx = 0x4c204665;   // literal original sem separadores inválidos
+            int out[4];
+            __cpuidex(out, 0, 0);
+            regs->rax = (UINT32)out[0];
+            // GenuineIntel vendor string is returned in EBX, EDX, ECX order.
+            regs->rbx = 0x756e4547; // "GenU"
+            regs->rdx = 0x49656e69; // "ineI"
+            regs->rcx = 0x6c65746e; // "ntel"
         }
         else if (regs->rax == 1) {
-            // You must spoof the family/model to match the "Intel" string
-            // Example for a common Intel CPU:
-            regs->rax = 0x000306a5; // Family 6, Model 165
-            regs->rbx = 0x00000000;
-            regs->rcx = 0x00000000;
-            regs->rdx = 0x00000000;
+            int out[4];
+            __cpuidex(out, (int)regs->rax, (int)regs->rcx);
+            regs->rax = (UINT32)out[0];
+            regs->rbx = (UINT32)out[1];
+            regs->rcx = (UINT32)out[2];
+            regs->rdx = (UINT32)out[3];
+            // Mask out the Hypervisor Present bit to hide the VM
+            regs->rcx &= ~(1ULL << 31);
         }
         else {
             int out[4];
@@ -76,78 +151,123 @@ BOOLEAN VmExitHandler(PGUEST_REGS regs)
             regs->rcx = (UINT32)out[2];
             regs->rdx = (UINT32)out[3];
         }
-        VmxAdvanceGuestRip();
-        break;
+        if (!VmxAdvanceGuestRip()) return FALSE;
+        return TRUE;
     }
+
 
     case EXIT_REASON_MSR_READ:
     {
-        // Example: Spoofing a specific MSR (e.g., IA32_PLATFORM_ID)
-        if (regs->rcx == 0x80) {
-            regs->rax = 0x12345678;
-            regs->rdx = 0x9abcdef0;
+        UINT64 value = __readmsr((ULONG)regs->rcx);
+        regs->rax = (UINT32)value;
+        regs->rdx = (UINT32)(value >> 32);
+        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
+        return TRUE;
+
+    }
+
+    case EXIT_REASON_MSR_WRITE:
+    {
+        if (regs->rcx != 0x17) {
+            __writemsr((ULONG)regs->rcx, (UINT64)(UINT32)regs->rax |
+                ((UINT64)(UINT32)regs->rdx << 32));
         }
-        else {
-            {
-                UINT64 value = __readmsr((ULONG)regs->rcx);
-                regs->rax = (UINT32)value;
-                regs->rdx = (UINT32)(value >> 32);
-            }
-        }
-        VmxAdvanceGuestRip();
-        break;
+        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
+        return TRUE;
+
     }
 
     case EXIT_REASON_CR_ACCESS:
     {
-        UINT64 cr_accessed = 0;
-        __vmx_vmread(VMCS_EXIT_QUALIFICATION, &cr_accessed);
-        if (!(cr_accessed & 1)) { // Read
-            if ((cr_accessed & 0x3) == 0) regs->rax = __readcr0();
-            if ((cr_accessed & 0x3) == 1) regs->rax = __readcr3();
-            if ((cr_accessed & 0x3) == 2) regs->rax = __readcr4();
-            if ((cr_accessed & 0x3) == 3) regs->rax = __readcr8();
+        UINT64 qualification = 0;
+        UINT8 crNumber, accessType, regIndex;
+        UINT64 value = 0;
+
+        if (__vmx_vmread(VMCS_EXIT_QUALIFICATION, &qualification) != 0)
+            return FALSE;
+
+        crNumber = (UINT8)(qualification & 0xF);
+        accessType = (UINT8)((qualification >> 4) & 0x3);
+        regIndex = (UINT8)((qualification >> 8) & 0xF);
+
+        if (accessType == 0) { /* MOV to CR */
+            if (!VmxReadGuestGpr(regs, regIndex, &value) ||
+                !VmxWriteGuestCr(crNumber, value))
+                return FALSE;
+        } else if (accessType == 1) { /* MOV from CR */
+            if (!VmxReadGuestCr(crNumber, &value) ||
+                !VmxWriteGuestGpr(regs, regIndex, value))
+                return FALSE;
+        } else if (accessType == 2 && crNumber == 0) { /* CLTS */
+            if (!VmxReadGuestCr(0, &value) ||
+                !VmxWriteGuestCr(0, value & ~(1ULL << 3)))
+                return FALSE;
+        } else if (accessType == 3 && crNumber == 0) { /* LMSW */
+            UINT64 source = (qualification >> 16) & 0xFFFF;
+            UINT64 oldValue;
+            if (!VmxReadGuestCr(0, &value))
+                return FALSE;
+            oldValue = value;
+            value = (value & ~0xFULL) | (source & 0xFULL);
+            value |= oldValue & 1; /* LMSW cannot clear CR0.PE. */
+            if (!VmxWriteGuestCr(0, value))
+                return FALSE;
+        } else {
+            return FALSE;
         }
-        else { // Write
-            // You MUST actually perform the write or the guest will loop forever
-            if ((cr_accessed & 0x3) == 0) __writecr0(regs->rax);
-            if ((cr_accessed & 0x3) == 1) __writecr3(regs->rax);
-            if ((cr_accessed & 0x3) == 2) __writecr4(regs->rax);
-            if ((cr_accessed & 0x3) == 3) __writecr8(regs->rax);
-        }
-        VmxAdvanceGuestRip();
-        break;
+
+        if (!VmxAdvanceGuestRip()) return FALSE;
+        return TRUE;
     }
+
+    case EXIT_REASON_VMXOFF:
+    {
+        UINT64 guestRip = 0, instructionLength = 0;
+
+        if (__vmx_vmread(VMCS_GUEST_RIP, &guestRip) != 0 ||
+            __vmx_vmread(VMCS_VM_EXIT_INSTRUCTION_LEN, &instructionLength) != 0 ||
+            instructionLength == 0 ||
+            __vmx_vmread(VMCS_GUEST_RSP, &g_VmxStopGuestRsp) != 0 ||
+            __vmx_vmread(VMCS_GUEST_RFLAGS, &g_VmxStopGuestRflags) != 0)
+            return FALSE;
+
+        g_VmxStopGuestRip = guestRip + instructionLength;
+
+        /* VMXOFF in non-root exits here; leave VMX before returning to caller. */
+        __vmx_off();
+        return 2; /* assembly restores the interrupted guest context */
+    }
+
+
+
     case EXIT_REASON_RDTSC:
     case EXIT_REASON_RDTSCP:
     {
-        UINT64 tsc = __rdtsc();
-        // Subtract the time spent in the handler itself
-        // This is a rough way to hide the VM Exit overhead
+        UINT64 tsc;
+        if (basicReason == EXIT_REASON_RDTSCP) {
+            unsigned int tscAux = 0;
+            tsc = __rdtscp(&tscAux);
+            regs->rcx = tscAux;
+        } else {
+            tsc = __rdtsc();
+        }
         regs->rax = (UINT32)(tsc - 1000);
         regs->rdx = (UINT32)((tsc - 1000) >> 32);
-        VmxAdvanceGuestRip();
-        break;
-    }
-    case EXIT_REASON_MSR_WRITE:
-    {
-        if (regs->rcx == 0x80) {
-            // Just pretend we wrote it. Don't actually write to the real MSR.
-        }
-        else {
-            __writemsr((ULONG)regs->rcx, (UINT64)(UINT32)regs->rax |
-                       ((UINT64)(UINT32)regs->rdx << 32));
-        }
-        VmxAdvanceGuestRip();
+        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
+        return TRUE;
         break;
     }
 
     default:
-        VmxAdvanceGuestRip();
-        break;
+        // DO NOT advance RIP here.
+        // If we reach default, it's an exit we didn't expect.
+        // Return FALSE so the assembly takes its fatal stop path.
+        return FALSE;
     }
+
     return TRUE;
 }
+
 
 /* ---------------------------------------------------------------------------
  * VmResumeFailed — chamado pelo asm se VMRESUME falhar (não deveria ocorrer).

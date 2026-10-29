@@ -51,6 +51,7 @@
 #define EXIT_REASON_CR_ACCESS           28
 #define EXIT_REASON_MSR_READ            31
 #define EXIT_REASON_MSR_WRITE           32
+#define EXIT_REASON_VMXOFF              26
 #define EXIT_REASON_RDMSR               EXIT_REASON_MSR_READ
 #define EXIT_REASON_RDTSC               0x40
 #define EXIT_REASON_RDTSCP              0x41
@@ -164,6 +165,10 @@
  * Bits de controle usados
  * ------------------------------------------------------------------------- */
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
+#define CPU_BASED_CR3_LOAD_EXITING             (1UL << 15)
+#define CPU_BASED_CR3_STORE_EXITING            (1UL << 16)
+#define CPU_BASED_CR8_LOAD_EXITING             (1UL << 19)
+#define CPU_BASED_CR8_STORE_EXITING            (1UL << 20)
 #define SECONDARY_EXEC_ENABLE_RDTSCP          (1UL << 3)
 #define SECONDARY_EXEC_ENABLE_XSAVES          (1UL << 20)
 
@@ -173,10 +178,7 @@
 #define PAGE_SIZE_4K                          0x1000
  
  /* CPU-Based VM-Execution Controls */
-#define CPU_BASED_VM_EXEC_CONTROL_CPUID               (1UL << 0)
-#define CPU_BASED_VM_EXEC_CONTROL_MSR_READ            (1UL << 2)
-#define CPU_BASED_VM_EXEC_CONTROL_MSR_WRITE           (1UL << 3)
-#define CPU_BASED_VM_EXEC_CONTROL_CR_ACCESS           (1UL << 10)
+#define CPU_BASED_VM_EXEC_CONTROL_USE_MSR_BITMAPS      (1UL << 28)
 
 
 

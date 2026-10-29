@@ -49,7 +49,10 @@ typedef struct _VCPU
     PVOID  VmmStack;             /* base da pilha do host (VMM)              */
     PVOID  MsrBitmap;            /* VA do MSR bitmap                         */
     UINT64 MsrBitmapPhys;        /* PA do MSR bitmap                         */
+    UINT64 OriginalCr0;
+    UINT64 OriginalCr4;
 
+    BOOLEAN ControlRegistersAdjusted;
     BOOLEAN VmxOnExecuted;       /* VMXON já executado neste core?           */
     BOOLEAN LaunchedOk;          /* VMLAUNCH bem-sucedido?                   */
 } VCPU, *PVCPU;
@@ -59,9 +62,14 @@ typedef struct _HV_GLOBALS
 {
     ULONG   ProcessorCount;
     PVCPU   VcpuArray;           /* um VCPU por processador lógico           */
+    ULONG   FailedProcessorIndex;
+    UINT64  LastVmxInstructionError;
 } HV_GLOBALS, *PHV_GLOBALS;
 
 extern HV_GLOBALS g_Hv;
+extern UINT64 g_VmxStopGuestRip;
+extern UINT64 g_VmxStopGuestRsp;
+extern UINT64 g_VmxStopGuestRflags;
 
 /* ---- C: vmx.c ---- */
 BOOLEAN VmxIsSupported(void);
@@ -69,8 +77,8 @@ NTSTATUS VmxInitializeAllProcessors(void);
 VOID     VmxShutdownAllProcessors(void);
 
 /* ---- C: vmexit.c ---- */
-/* Retorna TRUE p/ VMRESUME, FALSE p/ parar (desligar vmx). */
-BOOLEAN VmExitHandler(PGUEST_REGS regs);
+/* 0 = falha, 1 = VMRESUME, 2 = VMXOFF concluído e contexto restaurado. */
+UINT8   VmExitHandler(PGUEST_REGS regs);
 VOID    VmResumeFailed(void);
 
 /* ---- asm.asm ---- */
