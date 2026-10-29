@@ -1,94 +1,100 @@
 # VtxHypervisor
 hwid spoofer hypervisor
 
-Hypervisor de kernel (type-2, "thin") para Windows x64 usando Intel **VT-x**.
-Ao carregar, o driver virtualiza o próprio SO em todos os cores via `VMLAUNCH`
-e instala um **handler de VM-exit** que **avisa toda vez que um VM-exit é
-solicitado** e resume a VM.
+A thin, type-2 kernel hypervisor for Windows x64 using Intel **VT-x**.
+When loaded, the driver virtualizes the running OS on all logical processors
+with `VMLAUNCH` and installs a **VM-exit handler** that reports each requested
+VM-exit and resumes the VM.
 
-> Projeto educacional / de pesquisa. Requer CPU **Intel com VT-x habilitado na
-> BIOS**. Não roda com Hyper-V/VBS ativo (eles já ocupam o VMX root) — teste em
-> VM aninhada, máquina dedicada ou com Hyper-V desligado.
+> Educational/research project. Requires an **Intel CPU with VT-x enabled in
+> the BIOS**. It does not run while Hyper-V/VBS is active (they already occupy
+> VMX root); test in a nested VM, on a dedicated machine, or with Hyper-V
+> disabled.
 
-## Arquivos
+## Files
 
-| Arquivo        | Conteúdo                                                        |
-|----------------|-----------------------------------------------------------------|
-| `driver.c`     | `DriverEntry` / `DriverUnload`.                                 |
-| `vmx.c`        | Suporte a VMX, `VMXON`, montagem da VMCS, `VMLAUNCH`, shutdown. |
-| `vmexit.c`     | Handler de VM-exit (o "aviso" de exit).                         |
-| `asm.asm`      | Stubs x64: `AsmVmxLaunch`, `AsmVmexitHandler`, leitura de segmentos. |
-| `arch.h`       | MSRs, encodings da VMCS, bits de controle, exit reasons.        |
-| `vmx.h`        | Estruturas por-vCPU e protótipos.                               |
+| File | Contents |
+|---|---|
+| `driver.c` | `DriverEntry` / `DriverUnload`. |
+| `vmx.c` | VMX support, `VMXON`, VMCS setup, `VMLAUNCH`, and shutdown. |
+| `vmexit.c` | VM-exit handler. |
+| `asm.asm` | x64 stubs: `AsmVmxLaunch`, `AsmVmexitHandler`, and segment readers. |
+| `arch.h` | MSRs, VMCS encodings, control bits, and VM-exit reasons. |
+| `vmx.h` | Per-vCPU structures and prototypes. |
 
-## Como funciona (resumo)
+## How it works
 
-1. `DriverEntry` → `VmxInitializeAllProcessors()` fixa a thread em cada core.
-2. Por core: `VMXON` → preenche a VMCS (guest = estado atual da CPU, host =
-   VMM) → `AsmVmxLaunch()` executa `VMLAUNCH`.
-3. No sucesso, o guest continua o Windows normalmente; cada VM-exit cai em
-   `AsmVmexitHandler` (asm) → `VmExitHandler` (C), que imprime:
+1. `DriverEntry` calls `VmxInitializeAllProcessors()` and pins the thread to
+   each logical processor.
+2. On each processor: `VMXON` → populate the VMCS (guest = current CPU state,
+   host = VMM) → `AsmVmxLaunch()` executes `VMLAUNCH`.
+3. On success, the guest continues running Windows. Each VM-exit reaches
+   `AsmVmexitHandler` (assembly) → `VmExitHandler` (C), which prints:
    ```
    [Hvmx] VM-exit solicitada no core N (reason=R)
    ```
-   e resume a VM. (CPUID é reexecutado p/ a VM não quebrar; qualquer outro
-   exit apenas avança o RIP.)
+   The handler then resumes the VM. CPUID leaves 0 and 1 are handled by the
+   guest handler; other leaves are queried from the host with `__cpuidex`.
 
 ## Build
 
-Precisa de **Visual Studio + WDK** e suporte ao **MASM**.
+Requires **Visual Studio + WDK** and **MASM** support.
 
-1. Abra `VtxHypervisor.vcxproj` no Visual Studio (ou crie um projeto
-   *Empty WDM Driver* e adicione os arquivos).
-2. `asm.asm` já está configurado como item **Microsoft Macro Assembler** no
-   `.vcxproj`; a integração MASM é fornecida pelo WDK.
-3. Configuração **x64 / Debug** ou **Release** → **Build**.
-4. Saída: `x64\Debug\VtxHypervisor.sys`.
+1. Open `VtxHypervisor.vcxproj` in Visual Studio (or create an *Empty WDM
+   Driver* project and add the files).
+2. `asm.asm` is already configured as a **Microsoft Macro Assembler** item in
+   the `.vcxproj`; MASM integration is supplied by the WDK.
+3. Select **x64 / Debug** or **Release**, then choose **Build**.
+4. Output: `x64\Debug\VtxHypervisor.sys`.
 
-O build **Debug** está configurado para não assinar automaticamente o driver.
-Em Windows x64, o arquivo precisa de uma assinatura válida antes de poder ser
-carregado; habilitar `TESTSIGNING` sozinho não assina o `.sys`.
+The **Debug** configuration is set not to sign the driver automatically. On
+Windows x64, the file needs a valid signature before it can be loaded; enabling
+`TESTSIGNING` by itself does not sign the `.sys` file.
 
-### Linha de comando (EWDK)
+### Command line (EWDK)
+
 ```bat
 msbuild VtxHypervisor.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
-## Instalar / testar (em máquina de teste!)
+## Install / test (on a test machine!)
 
-Assine o `.sys` com um certificado de teste e habilite test-signing na máquina
-de teste antes de carregá-lo como serviço de kernel:
+Sign the `.sys` file with a test certificate and enable test signing on the test
+machine before loading it as a kernel service:
 
 ```bat
 bcdedit /set testsigning on
 ```
-(reinicie)
+(Restart.)
 
 ```bat
-sc create vtxhv type= kernel binPath= C:\caminho\VtxHypervisor.sys
+sc create vtxhv type= kernel binPath= C:\path\VtxHypervisor.sys
 sc start vtxhv
 ```
 
-Veja os avisos de VM-exit no **DebugView** (marque *Capture Kernel*) ou via
-WinDbg. Para descarregar:
+View VM-exit messages in **DebugView** (enable *Capture Kernel*) or through
+WinDbg. To unload:
 
 ```bat
 sc stop vtxhv
 sc delete vtxhv
 ```
 
-## O que modificar
+## What to modify
 
-- **Interceptar mais coisas**: ative bits em `VMCS_CPU_BASED_VM_EXEC_CONTROL`
-  (ex.: `RDMSR`/`WRMSR` via MSR bitmap, acesso a CR3, etc.) em `vmx.c`.
-- **Reagir a um exit específico**: adicione `case` em `VmExitHandler`
-  (`vmexit.c`). As exit reasons estão em `arch.h`.
-- **Driver de verdade (com device/IOCTL)**: criar `\Device\...` em `driver.c`.
+- **Intercept more events**: enable bits in `VMCS_CPU_BASED_VM_EXEC_CONTROL`
+  (for example, `RDMSR`/`WRMSR` via the MSR bitmap, or CR3 access) in `vmx.c`.
+- **Handle a specific exit**: add a `case` to `VmExitHandler` (`vmexit.c`). The
+  exit reasons are in `arch.h`.
+- **Make a full driver (with a device/IOCTL)**: create `\Device\...` in
+  `driver.c`.
 
-## Avisos
+## Warnings
 
-- `MmAllocateContiguousMemory` para VMXON/VMCS e `ExAllocatePoolZero` para a
-  pilha do VMM: tudo liberado no unload.
-- Um erro na VMCS faz `VMLAUNCH` falhar com um *VM-instruction-error* (impresso
-  no log). `VMRESUME` falho dispara um bugcheck proposital `0x1337`.
-- Teste sempre em VM/kernel-debug. Bug em hypervisor = travamento da máquina.
+- `MmAllocateContiguousMemory` is used for VMXON/VMCS and `ExAllocatePoolZero`
+  for the VMM stack; everything is freed on unload.
+- An invalid VMCS causes `VMLAUNCH` to fail with a *VM-instruction error*
+  (printed in the log). A failed `VMRESUME` intentionally triggers bug check
+  `0x1337`.
+- Always test in a VM/kernel-debug environment. A hypervisor bug can crash the
+  machine.
