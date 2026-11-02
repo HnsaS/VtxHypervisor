@@ -7,10 +7,76 @@
 
 #include "vmx.h"
 #include <intrin.h>
+#include <immintrin.h> /* _xsetbv */
 
 UINT64 g_VmxStopGuestRip;
 UINT64 g_VmxStopGuestRsp;
 UINT64 g_VmxStopGuestRflags;
+
+/* ---------------------------------------------------------------------------
+ * Raw debug channel. Plain port I/O only: no Windows API, no IRQL/IF
+ * requirements, so it still works inside VMX root and just before a hang.
+ *   - 0xE9  : QEMU/Bochs "debugcon" (-debugcon file:hv.log)
+ *   - 0x3F8 : COM1 (VMware serial-to-file, or a real UART)
+ * On hardware with neither, the writes are harmless no-ops.
+ * ------------------------------------------------------------------------- */
+#ifndef HV_TRACE_EXITS
+#define HV_TRACE_EXITS      1     /* log the first N VM-exits */
+#endif
+#define HV_TRACE_MAX_EXITS  512
+
+static void HvDbgChar(char c)
+{
+    int spin;
+    __outbyte(0xE9, (unsigned char)c);
+    for (spin = 0; spin < 20000 && (__inbyte(0x3FD) & 0x20) == 0; spin++)
+        ;
+    __outbyte(0x3F8, (unsigned char)c);
+}
+
+static void HvDbgStr(const char* s)
+{
+    while (*s) HvDbgChar(*s++);
+}
+
+static void HvDbgHex(UINT64 v)
+{
+    int shift;
+    HvDbgChar('0'); HvDbgChar('x');
+    for (shift = 60; shift >= 0; shift -= 4)
+        HvDbgChar("0123456789ABCDEF"[(v >> shift) & 0xF]);
+}
+
+static void HvDbgExit(const char* tag, ULONG cpu, UINT64 reason, UINT64 qual, UINT64 rip)
+{
+    HvDbgStr("[HV] "); HvDbgStr(tag);
+    HvDbgStr(" cpu="); HvDbgHex(cpu);
+    HvDbgStr(" reason="); HvDbgHex(reason);
+    HvDbgStr(" qual="); HvDbgHex(qual);
+    HvDbgStr(" rip="); HvDbgHex(rip);
+    HvDbgStr("\r\n");
+}
+
+/* Queue a hardware exception for delivery on the next VM-entry. Callers must
+   NOT advance guest RIP for a fault. */
+static BOOLEAN VmxInjectException(UINT8 vector, BOOLEAN hasErrorCode, UINT32 errorCode)
+{
+    UINT64 info = (UINT64)vector | (3ULL << 8) /* hardware exception */ | (1ULL << 31);
+
+    if (hasErrorCode)
+    {
+        info |= (1ULL << 11);
+        if (__vmx_vmwrite(VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE, errorCode) != 0)
+            return FALSE;
+    }
+    return __vmx_vmwrite(VMCS_VM_ENTRY_INTERRUPTION_INFO, info) == 0;
+}
+
+/* RDMSR/WRMSR outside these two ranges always VM-exit; real hardware #GPs. */
+static BOOLEAN VmxMsrIndexInArchitecturalRange(UINT32 msr)
+{
+    return msr <= 0x1FFF || (msr >= 0xC0000000u && msr <= 0xC0001FFFu);
+}
 
 /* avança o RIP do guest pelo tamanho da instrução que causou o exit */
 static BOOLEAN VmxAdvanceGuestRip(void)
@@ -141,6 +207,9 @@ static UINT8 VmExitHandlerCore(
     {
     case EXIT_REASON_CPUID:
     {
+        /* CPUID only looks at EAX; upper RAX bits are don't-care. */
+        regs->rax = (UINT32)regs->rax;
+        regs->rcx = (UINT32)regs->rcx;
         if (regs->rax == 0) {
             int out[4];
             __cpuidex(out, 0, 0);
@@ -175,7 +244,14 @@ static UINT8 VmExitHandlerCore(
 
     case EXIT_REASON_MSR_READ:
     {
-        UINT64 value = __readmsr((ULONG)regs->rcx);
+        UINT64 value;
+        /* An invalid MSR in root mode would #GP inside the VMM (on a pool
+           stack, IF=0) and wedge the box. Reflect the #GP to the guest. */
+        if (!VmxMsrIndexInArchitecturalRange((UINT32)regs->rcx)) {
+            if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+            return VMEXIT_RESULT_RESUME;
+        }
+        value = __readmsr((ULONG)regs->rcx);
         regs->rax = (UINT32)value;
         regs->rdx = (UINT32)(value >> 32);
         if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
@@ -185,6 +261,10 @@ static UINT8 VmExitHandlerCore(
 
     case EXIT_REASON_MSR_WRITE:
     {
+        if (!VmxMsrIndexInArchitecturalRange((UINT32)regs->rcx)) {
+            if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+            return VMEXIT_RESULT_RESUME;
+        }
         if (regs->rcx != 0x17) {
             __writemsr((ULONG)regs->rcx, (UINT64)(UINT32)regs->rax |
                 ((UINT64)(UINT32)regs->rdx << 32));
@@ -252,6 +332,49 @@ static UINT8 VmExitHandlerCore(
     }
 
 
+
+    /* XSETBV exits unconditionally in VMX non-root. Windows executes it during
+       CPU bring-up and resume; leaving it unhandled is fatal. */
+    case EXIT_REASON_XSETBV:
+    {
+        int leaf[4];
+        UINT32 index = (UINT32)regs->rcx;
+        UINT64 value = ((UINT64)(UINT32)regs->rdx << 32) | (UINT32)regs->rax;
+        UINT64 supported;
+
+        __cpuidex(leaf, 0x0D, 0);
+        supported = ((UINT64)(UINT32)leaf[3] << 32) | (UINT32)leaf[0];
+
+        /* Only XCR0 exists; x87 must stay on; no unsupported components;
+           AVX requires SSE. Anything else is a #GP on real hardware, and
+           executing it here would #GP inside the VMM instead. */
+        if (index != 0 ||
+            (value & 1) == 0 ||
+            (value & ~supported) != 0 ||
+            ((value & 4) != 0 && (value & 2) == 0))
+        {
+            if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
+            return VMEXIT_RESULT_RESUME;
+        }
+        _xsetbv(index, value);
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
+    }
+
+    case EXIT_REASON_INVD:
+        __wbinvd(); /* INVD can lose dirty lines; WBINVD is the safe stand-in */
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
+
+    /* VMX instructions and GETSEC are not available to this guest: #UD. */
+    case EXIT_REASON_GETSEC:
+    case EXIT_REASON_VMCALL:
+    case 19: case 20: case 21: case 22: case 23: case 24: case 25: /* VMCLEAR..VMWRITE */
+    case 27:                                                      /* VMXON  */
+    case EXIT_REASON_INVEPT:
+    case EXIT_REASON_INVVPID:
+        if (!VmxInjectException(6, FALSE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
 
     case EXIT_REASON_RDTSC:
     case EXIT_REASON_RDTSCP:
@@ -333,6 +456,14 @@ UINT8 VmExitHandler(PGUEST_REGS regs, PVCPU vcpu)
         goto done;
     }
 
+#if HV_TRACE_EXITS
+    /* Logged BEFORE handling: if the box wedges, the last line on the debug
+       channel is the exit that was being processed. */
+    if ((ULONG)g_VmxVmexitCount <= HV_TRACE_MAX_EXITS)
+        HvDbgExit("exit ", processorIndex, exitReason,
+                  diagnostics->ExitQualification, diagnostics->GuestRip);
+#endif
+
     result = VmExitHandlerCore(regs, exitReason,
         diagnostics->ExitQualification, &failureCode);
 
@@ -340,6 +471,11 @@ done:
     diagnostics->HandlerResult = result;
     diagnostics->FailureCode = failureCode;
     if (result == VMEXIT_RESULT_FATAL) {
+        HvDbgExit("FATAL", processorIndex, exitReason,
+                  diagnostics->ExitQualification, diagnostics->GuestRip);
+        HvDbgStr("[HV]   failureCode="); HvDbgHex((UINT64)failureCode);
+        HvDbgStr(" guestRsp="); HvDbgHex(diagnostics->GuestRsp);
+        HvDbgStr("\r\n");
         if (failureCode == VmexitFailureVmEntry) {
             diagnostics->FailureStage = VmxFailureVmEntryFailure;
         } else {

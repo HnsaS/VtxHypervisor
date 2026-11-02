@@ -382,11 +382,18 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
     // bit. Use a zeroed MSR bitmap so ordinary MSR accesses stay native
     // instead of generating an exit for every access.
     {
-        UINT32 requiredControls = CPU_BASED_USE_MSR_BITMAPS;
+        UINT32 primaryMsr = VmxGetControlMsr(MSR_IA32_VMX_PROCBASED_CTLS,
+                                             MSR_IA32_VMX_TRUE_PROCBASED_CTLS);
+        /* Secondary controls are REQUIRED for a transparent type-2 launch:
+           without them RDTSCP, INVPCID and XSAVES/XRSTORS raise #UD in VMX
+           non-root even though CPUID (passed through) says they exist. */
+        BOOLEAN haveSecondary =
+            (((__readmsr(primaryMsr) >> 32) &
+              CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) != 0);
+        UINT32 requiredControls = CPU_BASED_USE_MSR_BITMAPS |
+            (haveSecondary ? CPU_BASED_ACTIVATE_SECONDARY_CONTROLS : 0);
         UINT32 permittedControls = requiredControls | CPU_BASED_DEFAULT1_CONTROLS;
-        UINT32 primaryControls = VmxAdjustControls(requiredControls,
-            VmxGetControlMsr(MSR_IA32_VMX_PROCBASED_CTLS,
-                             MSR_IA32_VMX_TRUE_PROCBASED_CTLS));
+        UINT32 primaryControls = VmxAdjustControls(requiredControls, primaryMsr);
 
         if ((primaryControls & requiredControls) != requiredControls ||
             (primaryControls & ~permittedControls) != 0)
@@ -398,6 +405,33 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
             return STATUS_NOT_SUPPORTED;
         }
         VMWRITE(VMCS_CPU_BASED_VM_EXEC_CONTROL, primaryControls);
+
+        if (haveSecondary)
+        {
+            /* Each bit is silently dropped by VmxAdjustControls when the CPU
+               cannot enable it, which is fine: the instruction then does not
+               exist natively either (CPUID reports it absent). */
+            UINT32 wantedSecondary = SECONDARY_EXEC_ENABLE_RDTSCP |
+                                     SECONDARY_EXEC_ENABLE_INVPCID |
+                                     SECONDARY_EXEC_ENABLE_XSAVES |
+                                     SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE;
+            UINT32 secondaryControls = VmxAdjustControls(wantedSecondary,
+                MSR_IA32_VMX_PROCBASED_CTLS2);
+
+            /* A forced-1 secondary bit outside our list would be an exit we
+               do not handle. Refuse instead of hanging later. */
+            if ((secondaryControls & ~wantedSecondary) != 0)
+            {
+                vcpu->Diagnostics.FailureStage = VmxFailureSecondaryControlConfiguration;
+                vcpu->Diagnostics.FailedVmcsField = VMCS_SECONDARY_VM_EXEC_CONTROL;
+                vcpu->Diagnostics.FailureDetail = secondaryControls;
+                vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+                return STATUS_NOT_SUPPORTED;
+            }
+            VMWRITE(VMCS_SECONDARY_VM_EXEC_CONTROL, secondaryControls);
+            if (secondaryControls & SECONDARY_EXEC_ENABLE_XSAVES)
+                VMWRITE(VMCS_XSS_EXITING_BITMAP, 0); /* never exit on XSAVES */
+        }
 
         /* CR3-load exiting is mandatory on some VMX processors. A zero
            target count makes every guest MOV to CR3 exit to our handler. */

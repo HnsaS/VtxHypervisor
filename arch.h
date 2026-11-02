@@ -200,7 +200,20 @@
                                                 (1UL << 6) | (1UL << 7) | \
                                                 (1UL << 8) | (1UL << 12))
 #define SECONDARY_EXEC_ENABLE_RDTSCP          (1UL << 3)
+#define SECONDARY_EXEC_ENABLE_INVPCID         (1UL << 12)
 #define SECONDARY_EXEC_ENABLE_XSAVES          (1UL << 20)
+#define SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE (1UL << 26)
+
+/* VM-entry event injection + XSS-exiting bitmap */
+#define VMCS_XSS_EXITING_BITMAP               0x202C
+#define VMCS_VM_ENTRY_INTERRUPTION_INFO       0x4016
+#define VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE    0x4018
+
+#define EXIT_REASON_GETSEC                    11
+#define EXIT_REASON_INVD                      13
+#define EXIT_REASON_XSETBV                    55
+#define EXIT_REASON_INVEPT                    50
+#define EXIT_REASON_INVVPID                   53
 
 #define VM_EXIT_HOST_ADDR_SPACE_SIZE          (1UL << 9)   /* host é 64-bit */
 #define VM_ENTRY_IA32E_MODE                   (1UL << 9)   /* guest é 64-bit */
