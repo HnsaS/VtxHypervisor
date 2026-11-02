@@ -76,7 +76,8 @@ typedef enum _VMX_FAILURE_STAGE
     VmxFailurePrimaryControlConfiguration,
     VmxFailureExitControlConfiguration,
     VmxFailureEntryControlConfiguration,
-    VmxFailureVmEntryFailure
+    VmxFailureVmEntryFailure,
+    VmxFailureSecondaryControlConfiguration
 } VMX_FAILURE_STAGE;
 
 typedef enum _VMEXIT_FAILURE_CODE
