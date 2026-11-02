@@ -14,6 +14,12 @@
 
 HV_GLOBALS g_Hv = { 0 };
 
+volatile LONG g_VmxProgressStage = HvLaunchTraceIdle;
+volatile LONG g_VmxProgressProcessor = -1;
+volatile LONG g_VmxVmexitCount = 0;
+volatile LONG g_VmxLaunchInProgress = 0;
+DECLSPEC_ALIGN(8) volatile LONG64 g_VmxLaunchStartTime = 0;
+
 /* ----- descritor de segmento (GDT) ------------------------------------- */
 #pragma pack(push, 1)
 typedef struct _SEG_DESCRIPTOR
@@ -28,9 +34,9 @@ typedef struct _SEG_DESCRIPTOR
 #pragma pack(pop)
 
 /* ---------------------------------------------------------------------------
- * Ajusta um valor de controle pelos bits allowed-0/allowed-1 do MSR de
- * capacidade (a parte baixa marca controles cujo valor 0 não é permitido;
- * a parte alta marca controles cujo valor 1 é permitido).
+ * Ajusta os controles conforme IA32_VMX_*_CTLS: se um bit da metade baixa
+ * está em 1, o controle correspondente não pode ser 0; a metade alta indica
+ * quais controles podem ser 1.
  * ------------------------------------------------------------------------- */
 static UINT32 VmxAdjustControls(UINT32 desired, UINT32 capabilityMsr)
 {
@@ -38,7 +44,7 @@ static UINT32 VmxAdjustControls(UINT32 desired, UINT32 capabilityMsr)
     UINT32 mustBeOne = (UINT32)capability;
     UINT32 allowedOne = (UINT32)(capability >> 32);
 
-    desired |= mustBeOne;      /* força 1 nos bits cujo zero não é permitido */
+    desired |= mustBeOne;      /* bits 1 na metade baixa precisam ficar em 1 */
     desired &= allowedOne;     /* remove bits que não podem ser 1            */
     return desired;
 }
@@ -103,8 +109,8 @@ static PVOID VmxAllocContiguousPage(PUINT64 physOut)
 {
     PHYSICAL_ADDRESS max;
     PVOID va;
-
-    max.QuadPart = MAXULONG64;
+    /* Keep VMX regions below 4 GiB for CPUs with a 32-bit VMX region limit. */
+    max.QuadPart = 0xFFFFFFFFULL;
     va = MmAllocateContiguousMemory(PAGE_SIZE_4K, max);
     if (va)
     {
@@ -125,6 +131,20 @@ BOOLEAN VmxIsSupported(void)
     __cpuid(regs, 1);
     if ((regs[2] & (1 << 5)) == 0)          /* ECX bit 5 = VMX              */
         return FALSE;
+    /* Do not attempt to claim VMX when Windows is already under a hypervisor
+       (Hyper-V/VBS or a parent VM). This project has no nested-VMX support. */
+    if ((regs[2] & (1U << 31)) != 0)
+        return FALSE;
+
+    /* These allocations are cached/WB. Refuse a VMX format this allocator
+       cannot satisfy, before changing CR0/CR4 or entering VMX operation. */
+    {
+        UINT64 vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
+        UINT32 vmcsSize = (UINT32)((vmxBasic >> 32) & 0x1FFF);
+        UINT32 vmcsMemoryType = (UINT32)((vmxBasic >> 50) & 0xF);
+        if (vmcsSize > PAGE_SIZE_4K || vmcsMemoryType != 6)
+            return FALSE;
+    }
 
     featureControl = __readmsr(MSR_IA32_FEATURE_CONTROL);
     if (featureControl & FEATURE_CONTROL_LOCK)
@@ -163,18 +183,34 @@ static void VmxAdjustControlRegisters(PVCPU vcpu)
     __writecr4(cr4 | CR4_VMXE);     /* garante VMXE ligado                  */
 }
 
+/* Roll back on the same processor before returning to ordinary kernel code. */
+static void VmxRestoreControlRegisters(PVCPU vcpu)
+{
+    if (!vcpu->ControlRegistersAdjusted)
+        return;
+
+    __writecr4(vcpu->OriginalCr4);
+    __writecr0(vcpu->OriginalCr0);
+    vcpu->ControlRegistersAdjusted = FALSE;
+}
+
 /* ---------------------------------------------------------------------------
- * VmxEnterRoot — aloca a região VMXON e executa VMXON neste core.
+ * VmxEnterRoot — prepara os registradores de controle e executa VMXON.
  * ------------------------------------------------------------------------- */
 static NTSTATUS VmxEnterRoot(PVCPU vcpu)
 {
     UINT64 vmxBasic;
 
-    VmxAdjustControlRegisters(vcpu);
+    /* VMX capabilities and FEATURE_CONTROL are processor-local. */
+    if (!VmxIsSupported())
+    {
+        vcpu->Diagnostics.FailureStage = VmxFailureProcessorSupport;
+        vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+        vcpu->Diagnostics.FailureDetail = 1; /* processor-local VMX support check */
+        return STATUS_NOT_SUPPORTED;
+    }
 
-    vcpu->VmxonRegion = VmxAllocContiguousPage(&vcpu->VmxonRegionPhys);
-    if (!vcpu->VmxonRegion)
-        return STATUS_INSUFFICIENT_RESOURCES;
+    VmxAdjustControlRegisters(vcpu);
 
     /* revision identifier (bits 30:0 do IA32_VMX_BASIC) no início da região */
     vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
@@ -182,16 +218,14 @@ static NTSTATUS VmxEnterRoot(PVCPU vcpu)
 
     if (__vmx_on(&vcpu->VmxonRegionPhys) != 0)
     {
-        DbgPrint("[Hvmx] VMXON falhou no core %lu\n", KeGetCurrentProcessorNumber());
+        vcpu->Diagnostics.FailureStage = VmxFailureVmxon;
+        vcpu->Diagnostics.VmxOperationStatus = STATUS_INVALID_DEVICE_STATE;
         return STATUS_INVALID_DEVICE_STATE;
     }
 
     vcpu->VmxOnExecuted = TRUE;
     return STATUS_SUCCESS;
 }
-
-/* wrapper curto p/ vmwrite */
-#define VMWRITE(field, value)  __vmx_vmwrite((field), (UINT64)(value))
 
 /* ---------------------------------------------------------------------------
  * VmxSetupVmcs — preenche a VMCS com guest-state (= estado atual da CPU),
@@ -201,17 +235,29 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
 {
     UINT64 vmxBasic;
 
-    vcpu->VmcsRegion = VmxAllocContiguousPage(&vcpu->VmcsRegionPhys);
-    if (!vcpu->VmcsRegion)
-        return STATUS_INSUFFICIENT_RESOURCES;
-
     vmxBasic = __readmsr(MSR_IA32_VMX_BASIC);
     *(UINT32*)vcpu->VmcsRegion = (UINT32)(vmxBasic & 0x7FFFFFFF);
 
     if (__vmx_vmclear(&vcpu->VmcsRegionPhys) != 0)
+    {
+        vcpu->Diagnostics.FailureStage = VmxFailureVmclear;
         return STATUS_INVALID_PARAMETER;
+    }
     if (__vmx_vmptrld(&vcpu->VmcsRegionPhys) != 0)
+    {
+        vcpu->Diagnostics.FailureStage = VmxFailureVmptrld;
         return STATUS_INVALID_PARAMETER;
+    }
+
+#define VMWRITE(field, value) do { \
+        int vmwriteStatus = __vmx_vmwrite((field), (UINT64)(value)); \
+        if (vmwriteStatus != 0) { \
+            vcpu->Diagnostics.FailureStage = VmxFailureVmcsWrite; \
+            vcpu->Diagnostics.FailedVmcsField = (UINT32)(field); \
+            vcpu->Diagnostics.VmxOperationStatus = vmwriteStatus; \
+            return STATUS_INVALID_PARAMETER; \
+        } \
+    } while (0)
 
     /* ---------------- GUEST STATE ---------------- */
     VMWRITE(VMCS_GUEST_CR0, __readcr0());
@@ -227,6 +273,12 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
     VMWRITE(VMCS_GUEST_GS_SELECTOR, AsmGetGs());
     VMWRITE(VMCS_GUEST_LDTR_SELECTOR, AsmGetLdtr());
     VMWRITE(VMCS_GUEST_TR_SELECTOR, AsmGetTr());
+    /* Enter the guest in the normal active state, without an STI/MOV-SS
+       interrupt shadow or pending debug exception. Do not rely on the
+       implementation-defined contents of an uninitialized VMCS field. */
+    VMWRITE(VMCS_GUEST_INTERRUPTIBILITY_STATE, 0);
+    VMWRITE(VMCS_GUEST_ACTIVITY_STATE, 0); /* Active */
+    VMWRITE(VMCS_GUEST_PENDING_DBG_EXCEPTIONS, 0);
     VMWRITE(VMCS_GUEST_CS_LIMIT, __segmentlimit(AsmGetCs()));
     VMWRITE(VMCS_GUEST_SS_LIMIT, __segmentlimit(AsmGetSs()));
     VMWRITE(VMCS_GUEST_DS_LIMIT, __segmentlimit(AsmGetDs()));
@@ -261,7 +313,32 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
     VMWRITE(VMCS_VMCS_LINK_POINTER, ~0ULL);
 
     /* ---------------- HOST STATE ---------------- */
-    VMWRITE(VMCS_HOST_CR0, __readcr0());
+    {
+        UINT64 hostCr0 = __readcr0() & ~(CR0_EM | CR0_TS);
+        UINT64 fixed0 = __readmsr(MSR_IA32_VMX_CR0_FIXED0);
+        UINT64 fixed1 = __readmsr(MSR_IA32_VMX_CR0_FIXED1);
+
+        /* The VM-exit stub saves XMM0-XMM5 with MOVDQU. CR0.TS must be clear
+           in host mode or that first SIMD access raises #NM before C can run.
+           Guest CR0 is still captured unchanged above and restored by VMRESUME. */
+        if ((__readcr4() & CR4_OSFXSR) == 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailureControlRegisters;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_HOST_CR0;
+            vcpu->Diagnostics.FailureDetail = __readcr4();
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+            return STATUS_NOT_SUPPORTED;
+        }
+        if ((hostCr0 & fixed0) != fixed0 || (hostCr0 & ~fixed1) != 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailureControlRegisters;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_HOST_CR0;
+            vcpu->Diagnostics.FailureDetail = hostCr0;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+            return STATUS_NOT_SUPPORTED;
+        }
+        VMWRITE(VMCS_HOST_CR0, hostCr0);
+    }
     VMWRITE(VMCS_HOST_CR3, __readcr3());
     VMWRITE(VMCS_HOST_CR4, __readcr4());
     VMWRITE(VMCS_HOST_CS_SELECTOR, AsmGetCs() & 0xF8);
@@ -279,105 +356,175 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
     VMWRITE(VMCS_HOST_SYSENTER_CS, __readmsr(MSR_IA32_SYSENTER_CS));
     VMWRITE(VMCS_HOST_SYSENTER_ESP, __readmsr(MSR_IA32_SYSENTER_ESP));
     VMWRITE(VMCS_HOST_SYSENTER_EIP, __readmsr(MSR_IA32_SYSENTER_EIP));
-    VMWRITE(VMCS_HOST_RSP, (UINT64)vcpu->VmmStack + VMM_STACK_SIZE - 0x100);
+    VMWRITE(VMCS_HOST_RSP, (UINT64)vcpu->VmmStack + VMM_STACK_SIZE -
+            VMM_STACK_HOST_RSP_OFFSET);
     VMWRITE(VMCS_HOST_RIP, (UINT64)AsmVmexitHandler);
+    VMWRITE(VMCS_MSR_BITMAP, vcpu->MsrBitmapPhys);
 
     /* ---------------- CONTROLS ---------------- */
 
-    VMWRITE(VMCS_PIN_BASED_VM_EXEC_CONTROL,
-        VmxAdjustControls(0,
-            VmxGetControlMsr(MSR_IA32_VMX_PINBASED_CTLS,
-                             MSR_IA32_VMX_TRUE_PINBASED_CTLS)));
-
-    // CPUID always causes a VM exit. Use the bitmap for the selected MSR.
     {
-        const UINT32 requiredControls =
-            CPU_BASED_VM_EXEC_CONTROL_USE_MSR_BITMAPS |
-            CPU_BASED_CR3_LOAD_EXITING |
-            CPU_BASED_CR3_STORE_EXITING |
-            CPU_BASED_CR8_LOAD_EXITING |
-            CPU_BASED_CR8_STORE_EXITING;
+        UINT32 pinControls = VmxAdjustControls(0,
+            VmxGetControlMsr(MSR_IA32_VMX_PINBASED_CTLS,
+                             MSR_IA32_VMX_TRUE_PINBASED_CTLS));
+        if ((pinControls & ~PIN_BASED_DEFAULT1_CONTROLS) != 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailurePinControlConfiguration;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_PIN_BASED_VM_EXEC_CONTROL;
+            vcpu->Diagnostics.FailureDetail = pinControls;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+            return STATUS_NOT_SUPPORTED;
+        }
+        VMWRITE(VMCS_PIN_BASED_VM_EXEC_CONTROL, pinControls);
+    }
+
+    // CPUID exits unconditionally in VMX non-root; there is no CPUID control
+    // bit. Use a zeroed MSR bitmap so ordinary MSR accesses stay native
+    // instead of generating an exit for every access.
+    {
+        UINT32 requiredControls = CPU_BASED_USE_MSR_BITMAPS;
+        UINT32 permittedControls = requiredControls | CPU_BASED_DEFAULT1_CONTROLS;
         UINT32 primaryControls = VmxAdjustControls(requiredControls,
             VmxGetControlMsr(MSR_IA32_VMX_PROCBASED_CTLS,
                              MSR_IA32_VMX_TRUE_PROCBASED_CTLS));
 
-        if ((primaryControls & requiredControls) != requiredControls)
+        if ((primaryControls & requiredControls) != requiredControls ||
+            (primaryControls & ~permittedControls) != 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailurePrimaryControlConfiguration;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_CPU_BASED_VM_EXEC_CONTROL;
+            vcpu->Diagnostics.FailureDetail = primaryControls;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
             return STATUS_NOT_SUPPORTED;
-        if (VMWRITE(VMCS_CPU_BASED_VM_EXEC_CONTROL, primaryControls) != 0)
-            return STATUS_INVALID_PARAMETER;
+        }
+        VMWRITE(VMCS_CPU_BASED_VM_EXEC_CONTROL, primaryControls);
+
+        /* CR3-load exiting is mandatory on some VMX processors. A zero
+           target count makes every guest MOV to CR3 exit to our handler. */
+        VMWRITE(VMCS_CR3_TARGET_COUNT, 0);
     }
 
-    // MSR bitmap: intercept reads of IA32_PLATFORM_ID (MSR 0x17) only.
-    vcpu->MsrBitmap = VmxAllocContiguousPage(&vcpu->MsrBitmapPhys);
-    if (!vcpu->MsrBitmap) return STATUS_INSUFFICIENT_RESOURCES;
-
-    RtlZeroMemory(vcpu->MsrBitmap, PAGE_SIZE_4K);
-    UINT32* bitmap = (UINT32*)vcpu->MsrBitmap;
-    /* Intercept read of IA32_PLATFORM_ID (MSR 0x17); do not intercept writes. */
-    bitmap[0x17 / 32] |= (1UL << (0x17 % 32));
-
-    VMWRITE(VMCS_MSR_BITMAP, vcpu->MsrBitmapPhys);
-
     VMWRITE(VMCS_EXCEPTION_BITMAP, 0);
-    VMWRITE(VMCS_VM_EXIT_CONTROLS,
-        VmxAdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE,
+    {
+        UINT32 exitControls = VmxAdjustControls(VM_EXIT_HOST_ADDR_SPACE_SIZE,
             VmxGetControlMsr(MSR_IA32_VMX_EXIT_CTLS,
-                             MSR_IA32_VMX_TRUE_EXIT_CTLS)));
-    VMWRITE(VMCS_VM_ENTRY_CONTROLS,
-        VmxAdjustControls(VM_ENTRY_IA32E_MODE,
+                             MSR_IA32_VMX_TRUE_EXIT_CTLS));
+        UINT32 entryControls = VmxAdjustControls(VM_ENTRY_IA32E_MODE,
             VmxGetControlMsr(MSR_IA32_VMX_ENTRY_CTLS,
-                             MSR_IA32_VMX_TRUE_ENTRY_CTLS)));
-    VMWRITE(VMCS_CR0_GUEST_HOST_MASK, MAXULONGLONG);
-    VMWRITE(VMCS_CR4_GUEST_HOST_MASK, MAXULONGLONG);
+                             MSR_IA32_VMX_TRUE_ENTRY_CTLS));
+        /* VMX may require the documented default-1 VM-exit controls. They
+           are part of the processor's mandatory baseline, not unsupported
+           optional features. Keep rejecting any forced bit outside that
+           baseline and the required 64-bit host setting. */
+        if ((exitControls & VM_EXIT_HOST_ADDR_SPACE_SIZE) == 0 ||
+            (exitControls & ~(VM_EXIT_HOST_ADDR_SPACE_SIZE |
+                              VM_EXIT_DEFAULT1_CONTROLS)) != 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailureExitControlConfiguration;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_VM_EXIT_CONTROLS;
+            vcpu->Diagnostics.FailureDetail = exitControls;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+            return STATUS_NOT_SUPPORTED;
+        }
+        if ((entryControls & VM_ENTRY_IA32E_MODE) == 0 ||
+            (entryControls & ~(VM_ENTRY_IA32E_MODE |
+                               VM_ENTRY_DEFAULT1_CONTROLS)) != 0)
+        {
+            vcpu->Diagnostics.FailureStage = VmxFailureEntryControlConfiguration;
+            vcpu->Diagnostics.FailedVmcsField = VMCS_VM_ENTRY_CONTROLS;
+            vcpu->Diagnostics.FailureDetail = entryControls;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
+            return STATUS_NOT_SUPPORTED;
+        }
+        VMWRITE(VMCS_VM_EXIT_CONTROLS, exitControls);
+        VMWRITE(VMCS_VM_ENTRY_CONTROLS, entryControls);
+    }
+    VMWRITE(VMCS_CR0_GUEST_HOST_MASK, 0);
+    VMWRITE(VMCS_CR4_GUEST_HOST_MASK, 0);
     VMWRITE(VMCS_CR0_READ_SHADOW, __readcr0());
     VMWRITE(VMCS_CR4_READ_SHADOW, __readcr4());
 
+#undef VMWRITE
     return STATUS_SUCCESS;
 }
 
 /* ---------------------------------------------------------------------------
- * VmxVirtualizeCurrentCpu — executa a sequência completa no core atual.
- * Roda com IRQL elevado e afinidade fixada (ver VmxInitializeAllProcessors).
+ * VmxVirtualizeCurrentCpu — executa a sequência no processador do DPC atual.
  * ------------------------------------------------------------------------- */
-static NTSTATUS VmxVirtualizeCurrentCpu(PVCPU vcpu, ULONG processorIndex)
+static NTSTATUS VmxVirtualizeCurrentCpu(PVCPU vcpu)
 {
     NTSTATUS status;
 
-    /* pilha do host (VMM) */
-    vcpu->VmmStack = ExAllocatePoolZero(NonPagedPool, VMM_STACK_SIZE, VMM_POOL_TAG);
-    if (!vcpu->VmmStack)
-        return STATUS_INSUFFICIENT_RESOURCES;
-
+    HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                    HvProgressCpuBegin, STATUS_SUCCESS);
     status = VmxEnterRoot(vcpu);
     if (!NT_SUCCESS(status))
+    {
+        HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                        HvProgressInitializationFailed, status);
+        VmxRestoreControlRegisters(vcpu);
         return status;
+    }
+    HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                    HvProgressVmxonComplete, STATUS_SUCCESS);
 
     status = VmxSetupVmcs(vcpu);
     if (!NT_SUCCESS(status))
-        return status;
-
-    /* VMLAUNCH. Em sucesso, AsmVmxLaunch retorna TRUE já como guest. */
-    if (!AsmVmxLaunch())
     {
-        UINT64 err = 0;
-        __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &err);
-        g_Hv.FailedProcessorIndex = processorIndex;
-        g_Hv.LastVmxInstructionError = err;
-        DbgPrint("[Hvmx] VMLAUNCH falhou no core %lu (VM-instruction-error=%llu)\n",
-                 KeGetCurrentProcessorNumber(), err);
+        HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                        HvProgressInitializationFailed, status);
         __vmx_off();
         vcpu->VmxOnExecuted = FALSE;
+        VmxRestoreControlRegisters(vcpu);
+        return status;
+    }
+    HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                    HvProgressVmcsReady, STATUS_SUCCESS);
+
+    /* VMLAUNCH. Em sucesso, AsmVmxLaunch retorna TRUE já como guest. */
+    InterlockedExchange(&g_VmxProgressProcessor,
+                        (LONG)vcpu->Diagnostics.ProcessorIndex);
+    InterlockedExchange(&g_VmxVmexitCount, 0);
+    InterlockedExchange(&g_VmxProgressStage, HvLaunchTraceVmlaunchBegin);
+    HvLaunchWatchdogStart(vcpu->Diagnostics.ProcessorIndex);
+    InterlockedExchange64(&g_VmxLaunchStartTime, (LONG64)KeQueryInterruptTime());
+    InterlockedExchange(&g_VmxLaunchInProgress, 1);
+    HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                    HvProgressVmlaunchBegin, STATUS_SUCCESS);
+    if (!AsmVmxLaunch())
+    {
+        InterlockedExchange(&g_VmxProgressStage, HvLaunchTraceVmlaunchReturned);
+        UINT64 err = 0;
+        int vmreadStatus = __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &err);
+        vcpu->Diagnostics.FailureStage = VmxFailureVmlaunch;
+        vcpu->Diagnostics.VmInstructionError = err;
+        vcpu->Diagnostics.VmInstructionErrorReadStatus = vmreadStatus;
+        vcpu->Diagnostics.VmxOperationStatus = STATUS_UNSUCCESSFUL;
+        /* Make a returned VMLAUNCH failure distinguishable from a hard hang
+           at VMLAUNCH_BEGIN after the next forced reboot. */
+        HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                        HvProgressVmlaunchReturned, STATUS_UNSUCCESSFUL);
+        __vmx_off();
+        vcpu->VmxOnExecuted = FALSE;
+        VmxRestoreControlRegisters(vcpu);
+        DbgPrint("[Hvmx] VMLAUNCH falhou no core %lu (VM-instruction-error=%I64u)\n",
+                 vcpu->Diagnostics.ProcessorIndex, err);
         return STATUS_UNSUCCESSFUL;
     }
 
+    InterlockedExchange(&g_VmxProgressStage, HvLaunchTraceVmlaunchReturned);
     vcpu->LaunchedOk = TRUE;
+    /* This registry write runs only after the minimal guest trampoline has
+       returned to C, keeping Zw* calls out of the first VMX non-root steps. */
+    HvProgressWrite(vcpu->Diagnostics.ProcessorIndex,
+                    HvProgressVmlaunchReturned, STATUS_SUCCESS);
     DbgPrint("[Hvmx] core %lu virtualizado (VMLAUNCH ok)\n",
-             KeGetCurrentProcessorNumber());
+             vcpu->Diagnostics.ProcessorIndex);
     return STATUS_SUCCESS;
 }
 
 /* ---------------------------------------------------------------------------
- * VmxInitializeAllProcessors — fixa a thread em cada core e virtualiza.
+ * VmxInitializeAllProcessors — prepara recursos e inicializa um CPU por vez.
  * ------------------------------------------------------------------------- */
 NTSTATUS VmxInitializeAllProcessors(void)
 {
@@ -393,34 +540,81 @@ NTSTATUS VmxInitializeAllProcessors(void)
         return STATUS_NOT_SUPPORTED;
     }
 
-    g_Hv.ProcessorCount = KeQueryActiveProcessorCount(NULL);
-    g_Hv.VcpuArray = ExAllocatePoolZero(NonPagedPool,
+    /* This code uses systemwide processor indexes and group affinity. */
+    g_Hv.ProcessorCount = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    g_Hv.VcpuArray = ExAllocatePoolZero(NonPagedPoolNx,
                                         sizeof(VCPU) * g_Hv.ProcessorCount,
                                         VMM_POOL_TAG);
     if (!g_Hv.VcpuArray)
         return STATUS_INSUFFICIENT_RESOURCES;
 
+    /* Complete every allocation before the first processor enters VMX. That
+       way an allocation failure cannot leave a partially virtualized system. */
     for (i = 0; i < g_Hv.ProcessorCount; i++)
     {
-        PROCESSOR_NUMBER procNum;
-        GROUP_AFFINITY affinity, oldAffinity;
+        PVCPU vcpu = &g_Hv.VcpuArray[i];
+        vcpu->Diagnostics.ProcessorIndex = i;
+        vcpu->VmmStack = ExAllocatePoolZero(NonPagedPoolNx, VMM_STACK_SIZE,
+                                             VMM_POOL_TAG);
+        if (vcpu->VmmStack)
+            *(PVCPU*)((PUCHAR)vcpu->VmmStack + VMM_STACK_SIZE -
+                      VMM_STACK_HOST_RSP_OFFSET +
+                      VMM_STACK_VCPU_POINTER_OFFSET) = vcpu;
+        if (vcpu->VmmStack)
+            vcpu->VmxonRegion = VmxAllocContiguousPage(&vcpu->VmxonRegionPhys);
+        if (vcpu->VmxonRegion)
+            vcpu->VmcsRegion = VmxAllocContiguousPage(&vcpu->VmcsRegionPhys);
+        if (vcpu->VmcsRegion)
+            vcpu->MsrBitmap = VmxAllocContiguousPage(&vcpu->MsrBitmapPhys);
+        if (!vcpu->VmmStack || !vcpu->VmxonRegion || !vcpu->VmcsRegion ||
+            !vcpu->MsrBitmap)
+        {
+            g_Hv.FailedProcessorIndex = i;
+            vcpu->Diagnostics.FailureStage = VmxFailureAllocation;
+            vcpu->Diagnostics.VmxOperationStatus = STATUS_INSUFFICIENT_RESOURCES;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
 
-        KeGetProcessorNumberFromIndex(i, &procNum);
+    /*
+     * Start CPUs serially at PASSIVE_LEVEL. A broadcast DPC creates a global
+     * rendezvous: if one CPU stalls during VMLAUNCH or its first VM-exit, every
+     * other CPU can remain blocked at KeSignalCallDpcSynchronize. Pin this
+     * thread to one processor for each transition so a bad CPU cannot strand
+     * the other startup callbacks at a barrier.
+     */
+    for (i = 0; i < g_Hv.ProcessorCount; i++)
+    {
+        PROCESSOR_NUMBER processorNumber;
+        GROUP_AFFINITY affinity, oldAffinity;
+        PVCPU vcpu = &g_Hv.VcpuArray[i];
+
+        KeGetProcessorNumberFromIndex(i, &processorNumber);
         RtlZeroMemory(&affinity, sizeof(affinity));
-        affinity.Group = procNum.Group;
-        affinity.Mask = (KAFFINITY)1 << procNum.Number;
+        affinity.Group = processorNumber.Group;
+        affinity.Mask = ((KAFFINITY)1) << processorNumber.Number;
         KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
 
-        status = VmxVirtualizeCurrentCpu(&g_Hv.VcpuArray[i], i);
+        vcpu->Diagnostics.ProcessorIndex = i;
+        status = VmxVirtualizeCurrentCpu(vcpu);
+        InterlockedExchange(&vcpu->Diagnostics.VmxOperationStatus, status);
+
+        if (NT_SUCCESS(status))
+            HvProgressWrite(i, HvProgressCpuComplete, STATUS_SUCCESS);
+
+        KeRevertToUserGroupAffinityThread(&oldAffinity);
+        InterlockedExchange(&g_VmxLaunchInProgress, 0);
+        HvLaunchWatchdogStop();
+
         if (!NT_SUCCESS(status))
         {
+            g_Hv.FailedProcessorIndex = i;
+            g_Hv.LastVmxInstructionError = vcpu->Diagnostics.VmInstructionError;
             DbgPrint("[Hvmx] falha ao virtualizar core %lu (status=0x%08X).\n",
                      i, status);
-            KeRevertToUserGroupAffinityThread(&oldAffinity);
             return status;
         }
 
-        KeRevertToUserGroupAffinityThread(&oldAffinity);
     }
 
     return STATUS_SUCCESS;
@@ -470,9 +664,7 @@ VOID VmxShutdownAllProcessors(void)
             affinity.Group = procNum.Group;
             affinity.Mask = (KAFFINITY)1 << procNum.Number;
             KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
-            __writecr4(vcpu->OriginalCr4);
-            __writecr0(vcpu->OriginalCr0);
-            vcpu->ControlRegistersAdjusted = FALSE;
+            VmxRestoreControlRegisters(vcpu);
             KeRevertToUserGroupAffinityThread(&oldAffinity);
         }
 

@@ -1,15 +1,15 @@
 # VtxHypervisor
 hwid spoofer hypervisor
 
-A thin, type-2 kernel hypervisor for Windows x64 using Intel **VT-x**.
-When loaded, the driver virtualizes the running OS on all logical processors
-with `VMLAUNCH` and installs a **VM-exit handler** that reports each requested
-VM-exit and resumes the VM.
+A minimal, experimental type-2 kernel hypervisor for Windows x64 using Intel
+**VT-x**. The current diagnostic configuration intercepts **CPUID only** and
+does not implement EPT or general VM-exit emulation.
 
 > Educational/research project. Requires an **Intel CPU with VT-x enabled in
-> the BIOS**. It does not run while Hyper-V/VBS is active (they already occupy
-> VMX root); test in a nested VM, on a dedicated machine, or with Hyper-V
-> disabled.
+> the BIOS**. Startup refuses when CPUID reports an existing hypervisor; this
+> project has no nested-VMX support. Test in a nested VM only if nested VMX is
+> exposed and the detection check is deliberately adapted for that setup, or
+> on a dedicated machine with Hyper-V/VBS disabled.
 
 ## Files
 
@@ -24,17 +24,15 @@ VM-exit and resumes the VM.
 
 ## How it works
 
-1. `DriverEntry` calls `VmxInitializeAllProcessors()` and pins the thread to
-   each logical processor.
+1. `DriverEntry` calls `VmxInitializeAllProcessors()`, allocates every vCPU's
+   resources, and starts all logical processors through a synchronized DPC
+   broadcast.
 2. On each processor: `VMXON` → populate the VMCS (guest = current CPU state,
    host = VMM) → `AsmVmxLaunch()` executes `VMLAUNCH`.
-3. On success, the guest continues running Windows. Each VM-exit reaches
-   `AsmVmexitHandler` (assembly) → `VmExitHandler` (C), which prints:
-   ```
-   [Hvmx] VM-exit solicitada no core N (reason=R)
-   ```
-   The handler then resumes the VM. CPUID leaves 0 and 1 are handled by the
-   guest handler; other leaves are queried from the host with `__cpuidex`.
+3. On success, Windows continues as the guest. CPUID causes a VM-exit, is
+   emulated by `VmExitHandler`, and then returns through `VMRESUME`. Other
+   VM-exits are not currently implemented; the handler records the failure
+   context and stops through a bug check rather than retrying an unknown exit.
 
 ## Build
 
@@ -72,8 +70,8 @@ sc create vtxhv type= kernel binPath= C:\path\VtxHypervisor.sys
 sc start vtxhv
 ```
 
-View VM-exit messages in **DebugView** (enable *Capture Kernel*) or through
-WinDbg. To unload:
+Startup messages go to **DebugView** (enable *Capture Kernel*) or WinDbg.
+Fatal VM-exit details are recorded for kernel-dump analysis. To unload:
 
 ```bat
 sc stop vtxhv
@@ -82,8 +80,9 @@ sc delete vtxhv
 
 ## What to modify
 
-- **Intercept more events**: enable bits in `VMCS_CPU_BASED_VM_EXEC_CONTROL`
-  (for example, `RDMSR`/`WRMSR` via the MSR bitmap, or CR3 access) in `vmx.c`.
+- **Intercept more events**: implement and validate the corresponding VM-exit
+  handler first, then add its control bit in `vmx.c`. Startup intentionally
+  rejects mandatory controls outside the currently implemented CPUID path.
 - **Handle a specific exit**: add a `case` to `VmExitHandler` (`vmexit.c`). The
   exit reasons are in `arch.h`.
 - **Make a full driver (with a device/IOCTL)**: create `\Device\...` in
@@ -91,8 +90,8 @@ sc delete vtxhv
 
 ## Warnings
 
-- `MmAllocateContiguousMemory` is used for VMXON/VMCS and `ExAllocatePoolZero`
-  for the VMM stack; everything is freed on unload.
+- VMXON/VMCS pages and all VMM stacks are allocated before any CPU enters VMX;
+  the stack uses non-executable nonpaged pool. VMX regions are kept below 4 GiB.
 - An invalid VMCS causes `VMLAUNCH` to fail with a *VM-instruction error*
   (printed in the log). A failed `VMRESUME` intentionally triggers bug check
   `0x1337`.

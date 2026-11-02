@@ -14,9 +14,17 @@ OPTION CASEMAP:NONE
 ; encodings da VMCS usados aqui (precisam bater com arch.h)
 VMCS_GUEST_RSP          EQU 0681Ch
 VMCS_GUEST_RIP          EQU 0681Eh
+VMCS_GUEST_RFLAGS       EQU 06820h
+VMM_VCPU_POINTER_OFFSET EQU 8
+VMEXIT_GUEST_REGS_SIZE  EQU 080h
+VMEXIT_SAVED_SIMD_SIZE  EQU 070h
+VMEXIT_VCPU_PTR_OFFSET  EQU VMEXIT_GUEST_REGS_SIZE + VMEXIT_SAVED_SIMD_SIZE + VMM_VCPU_POINTER_OFFSET
 
 EXTERN VmExitHandler:PROC
 EXTERN VmResumeFailed:PROC
+EXTERN VmExitFatal:PROC
+EXTERN g_VmxProgressStage:DWORD
+EXTERN g_VmxVmexitCount:DWORD
 EXTERN g_VmxStopGuestRip:QWORD
 EXTERN g_VmxStopGuestRsp:QWORD
 EXTERN g_VmxStopGuestRflags:QWORD
@@ -32,22 +40,37 @@ EXTERN g_VmxStopGuestRflags:QWORD
 ;     retorna TRUE (rax=1) ao chamador, agora em VMX non-root (guest).
 ;------------------------------------------------------------------------------
 AsmVmxLaunch PROC
+    ; RFLAGS was previously captured while building the VMCS, before registry
+    ; I/O and other calls. Capture it at the actual launch boundary so guest
+    ; IF/flags match the current kernel context.
+    pushfq
+    pop     rax
+    mov     rcx, VMCS_GUEST_RFLAGS
+    vmwrite rcx, rax
+    jbe     _VmxLaunchPrepFailed  ; VMfailValid/Invalid: return to C safely
+
     mov     rdx, rsp            ; GUEST_RSP = rsp atual
     mov     rcx, VMCS_GUEST_RSP
     vmwrite rcx, rdx
+    jbe     _VmxLaunchPrepFailed
 
     mov     rcx, VMCS_GUEST_RIP
     lea     rdx, _GuestResume   ; GUEST_RIP = _GuestResume
     vmwrite rcx, rdx
+    jbe     _VmxLaunchPrepFailed
 
     vmlaunch
 
     ; ---- só chega aqui se o VMLAUNCH falhar ----
+_VmxLaunchPrepFailed:
     xor     rax, rax            ; FALSE
     ret
 
 _GuestResume:
     ; ---- guest começa a executar aqui (modo non-root) ----
+    ; Keep this path minimal. Registry I/O here would trigger VM-exits while
+    ; testing the very first guest instructions and obscure the failure point.
+    mov     DWORD PTR [g_VmxProgressStage], 2 ; HvLaunchTraceGuestTrampoline
     mov     rax, 1              ; TRUE
     ret
 AsmVmxLaunch ENDP
@@ -59,6 +82,9 @@ AsmVmxLaunch ENDP
 ; e então VMRESUME (ou para, se o handler retornar FALSE).
 ;------------------------------------------------------------------------------
 AsmVmexitHandler PROC
+    cli                         ; VM-exit clears IF architecturally; enforce it here too.
+    lock inc DWORD PTR [g_VmxVmexitCount]
+    mov     DWORD PTR [g_VmxProgressStage], 3 ; HvLaunchTraceVmexitEntry
     push    r15
     push    r14
     push    r13
@@ -75,21 +101,27 @@ AsmVmexitHandler PROC
     push    rdx
     push    rcx
     push    rax
+    mov     DWORD PTR [g_VmxProgressStage], 7 ; all GPRs saved
 
     ; Preserve volatile SIMD state because the guest can be interrupted
     ; between arbitrary instructions and the C handler may use XMM0-XMM5.
-    sub     rsp, 60h
+    sub     rsp, VMEXIT_SAVED_SIMD_SIZE
     movdqu  XMMWORD PTR [rsp+00h], xmm0
     movdqu  XMMWORD PTR [rsp+10h], xmm1
     movdqu  XMMWORD PTR [rsp+20h], xmm2
     movdqu  XMMWORD PTR [rsp+30h], xmm3
     movdqu  XMMWORD PTR [rsp+40h], xmm4
     movdqu  XMMWORD PTR [rsp+50h], xmm5
+    stmxcsr DWORD PTR [rsp+60h]
+    mov     DWORD PTR [g_VmxProgressStage], 8 ; SIMD state saved
 
-    lea     rcx, [rsp+60h]      ; arg1 = PGUEST_REGS
+    lea     rcx, [rsp+VMEXIT_SAVED_SIMD_SIZE] ; arg1 = PGUEST_REGS
+    mov     rdx, QWORD PTR [rsp+VMEXIT_VCPU_PTR_OFFSET] ; arg2 = PVCPU
+    mov     DWORD PTR [g_VmxProgressStage], 9 ; immediately before C handler
     sub     rsp, 20h            ; shadow space
     call    VmExitHandler
     add     rsp, 20h
+    mov     DWORD PTR [g_VmxProgressStage], 10 ; C handler returned
 
     cmp     al, 2
     je      _LeaveVmx
@@ -100,7 +132,8 @@ AsmVmexitHandler PROC
     movdqu  xmm3, XMMWORD PTR [rsp+30h]
     movdqu  xmm4, XMMWORD PTR [rsp+40h]
     movdqu  xmm5, XMMWORD PTR [rsp+50h]
-    add     rsp, 60h
+    ldmxcsr DWORD PTR [rsp+60h]
+    add     rsp, VMEXIT_SAVED_SIMD_SIZE
     test    al, al
     jz      _StopVmx
 
@@ -121,8 +154,12 @@ AsmVmexitHandler PROC
     pop     r14
     pop     r15
 
+    mov     DWORD PTR [g_VmxProgressStage], 5 ; HvLaunchTraceVmresume
     vmresume
+    mov     rcx, QWORD PTR [rsp+VMM_VCPU_POINTER_OFFSET]
+    sub     rsp, 20h            ; shadow space da ABI x64
     call    VmResumeFailed      ; só chega aqui se o vmresume falhar
+    add     rsp, 20h
     hlt
 
 _StopVmx:
@@ -142,7 +179,10 @@ _StopVmx:
     pop     r13
     pop     r14
     pop     r15
-    call    VmResumeFailed
+    mov     rcx, QWORD PTR [rsp+VMM_VCPU_POINTER_OFFSET]
+    sub     rsp, 20h            ; shadow space da ABI x64
+    call    VmExitFatal
+    add     rsp, 20h
     hlt
 
 _LeaveVmx:
@@ -153,7 +193,8 @@ _LeaveVmx:
     movdqu  xmm3, XMMWORD PTR [rsp+30h]
     movdqu  xmm4, XMMWORD PTR [rsp+40h]
     movdqu  xmm5, XMMWORD PTR [rsp+50h]
-    add     rsp, 60h
+    ldmxcsr DWORD PTR [rsp+60h]
+    add     rsp, VMEXIT_SAVED_SIMD_SIZE
     pop     rax
     pop     rcx
     pop     rdx

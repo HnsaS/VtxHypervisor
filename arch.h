@@ -40,7 +40,12 @@
 #define FEATURE_CONTROL_VMXON_OUTSIDE_SMX (1ULL << 2)
 
 /* CR4.VMXE */
+#define CR0_EM                          (1ULL << 2)
+#define CR0_TS                          (1ULL << 3)
+#define CR4_OSFXSR                      (1ULL << 9)
 #define CR4_VMXE                        (1ULL << 13)
+#define CR4_PCIDE                       (1ULL << 17)
+#define CR3_PCID_NOFLUSH                (1ULL << 63)
 
 /* ---------------------------------------------------------------------------
  * VM-exit reasons (os que importam para este driver)
@@ -91,6 +96,7 @@
 #define VMCS_VM_EXIT_CONTROLS           0x400C
 #define VMCS_VM_ENTRY_CONTROLS          0x4012
 #define VMCS_SECONDARY_VM_EXEC_CONTROL  0x401E
+#define VMCS_CR3_TARGET_COUNT           0x400A
 
 /* 32-bit read-only data */
 #define VMCS_VM_INSTRUCTION_ERROR       0x4400
@@ -118,6 +124,8 @@
 #define VMCS_GUEST_GS_AR_BYTES          0x481E
 #define VMCS_GUEST_LDTR_AR_BYTES        0x4820
 #define VMCS_GUEST_TR_AR_BYTES          0x4822
+#define VMCS_GUEST_INTERRUPTIBILITY_STATE 0x4824
+#define VMCS_GUEST_ACTIVITY_STATE       0x4826
 #define VMCS_GUEST_SYSENTER_CS          0x482A
 
 /* natural-width control */
@@ -141,6 +149,7 @@
 #define VMCS_GUEST_GDTR_BASE            0x6816
 #define VMCS_GUEST_IDTR_BASE            0x6818
 #define VMCS_GUEST_DR7                  0x681A
+#define VMCS_GUEST_PENDING_DBG_EXCEPTIONS 0x6822
 #define VMCS_GUEST_RSP                  0x681C
 #define VMCS_GUEST_RIP                  0x681E
 #define VMCS_GUEST_RFLAGS               0x6820
@@ -167,8 +176,29 @@
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
 #define CPU_BASED_CR3_LOAD_EXITING             (1UL << 15)
 #define CPU_BASED_CR3_STORE_EXITING            (1UL << 16)
-#define CPU_BASED_CR8_LOAD_EXITING             (1UL << 19)
-#define CPU_BASED_CR8_STORE_EXITING            (1UL << 20)
+#define CPU_BASED_USE_MSR_BITMAPS               (1UL << 28)
+#define CPU_BASED_DEFAULT1_CONTROLS            ((1UL << 1) | (1UL << 4) | \
+                                                (1UL << 5) | (1UL << 6) | \
+                                                (1UL << 8) | (1UL << 13) | \
+                                                (1UL << 14) | \
+                                                CPU_BASED_CR3_LOAD_EXITING | \
+                                                CPU_BASED_CR3_STORE_EXITING | \
+                                                (1UL << 26))
+#define PIN_BASED_DEFAULT1_CONTROLS            ((1UL << 1) | (1UL << 2) | \
+                                                (1UL << 4))
+#define VM_EXIT_DEFAULT1_CONTROLS              ((1UL << 0) | (1UL << 1) | \
+                                                (1UL << 2) | (1UL << 3) | \
+                                                (1UL << 4) | (1UL << 5) | \
+                                                (1UL << 6) | (1UL << 7) | \
+                                                (1UL << 8) | (1UL << 10) | \
+                                                (1UL << 11) | (1UL << 13) | \
+                                                (1UL << 14) | (1UL << 16) | \
+                                                (1UL << 17))
+#define VM_ENTRY_DEFAULT1_CONTROLS             ((1UL << 0) | (1UL << 1) | \
+                                                (1UL << 2) | (1UL << 3) | \
+                                                (1UL << 4) | (1UL << 5) | \
+                                                (1UL << 6) | (1UL << 7) | \
+                                                (1UL << 8) | (1UL << 12))
 #define SECONDARY_EXEC_ENABLE_RDTSCP          (1UL << 3)
 #define SECONDARY_EXEC_ENABLE_XSAVES          (1UL << 20)
 
@@ -176,9 +206,8 @@
 #define VM_ENTRY_IA32E_MODE                   (1UL << 9)   /* guest é 64-bit */
 
 #define PAGE_SIZE_4K                          0x1000
- 
- /* CPU-Based VM-Execution Controls */
-#define CPU_BASED_VM_EXEC_CONTROL_USE_MSR_BITMAPS      (1UL << 28)
+
+/* CPUID always causes a VM-exit in VMX non-root; it has no execution-control bit. */
 
 
 

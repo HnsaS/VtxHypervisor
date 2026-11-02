@@ -1,12 +1,8 @@
 /*
  * vmexit.c — handler de VM-exit.
  *
- * Este é o "handle da exit" pedido: a cada VM-exit ele AVISA que um exit foi
- * solicitado (número do core + motivo) e então faz o mínimo necessário para
- * a VM continuar rodando (executa a instrução interceptada e avança o RIP).
- *
- * Não há tratamento especial por tipo de instrução — qualquer exit é apenas
- * sinalizado e resumido.
+ * Despacha VM-exits, registra o estado por processador e executa os casos
+ * explicitamente interceptados. Falhas preservam o último contexto para dump.
  */
 
 #include "vmx.h"
@@ -61,7 +57,8 @@ static BOOLEAN VmxReadGuestCr(UINT8 crNumber, UINT64* value)
     case 0: return __vmx_vmread(VMCS_GUEST_CR0, value) == 0;
     case 3: return __vmx_vmread(VMCS_GUEST_CR3, value) == 0;
     case 4: return __vmx_vmread(VMCS_GUEST_CR4, value) == 0;
-    case 8: *value = __readcr8(); return TRUE;
+    /* CR8 has no guest VMCS field; do not read the host's physical CR8. */
+    case 8: return FALSE;
     default: return FALSE;
     }
 }
@@ -84,7 +81,22 @@ static BOOLEAN VmxWriteGuestCr(UINT8 crNumber, UINT64 value)
         return __vmx_vmwrite(VMCS_CR0_READ_SHADOW, value) == 0;
     }
     case 3:
+    {
+        UINT64 guestCr4 = 0;
+
+        /* Bit 63 is the PCID no-flush request on MOV CR3. It is an
+           instruction operand flag, never part of the VMCS guest-CR3 field.
+           Preserve normal validation when PCID is disabled. */
+        if (__vmx_vmread(VMCS_GUEST_CR4, &guestCr4) != 0)
+            return FALSE;
+        if (value & CR3_PCID_NOFLUSH)
+        {
+            if ((guestCr4 & CR4_PCIDE) == 0)
+                return FALSE;
+            value &= ~CR3_PCID_NOFLUSH;
+        }
         return __vmx_vmwrite(VMCS_GUEST_CR3, value) == 0;
+    }
     case 4:
     {
         UINT64 fixed0 = __readmsr(MSR_IA32_VMX_CR4_FIXED0);
@@ -96,11 +108,8 @@ static BOOLEAN VmxWriteGuestCr(UINT8 crNumber, UINT64 value)
         return __vmx_vmwrite(VMCS_CR4_READ_SHADOW, value) == 0;
     }
     case 8:
-        /* CR8 is shared with the physical APIC TPR; it has no VMCS field. */
-        if ((value & ~0xFULL) != 0)
-            return FALSE;
-        __writecr8(value);
-        return TRUE;
+        /* Do not modify the host's physical APIC TPR while emulating the guest. */
+        return FALSE;
     default:
         return FALSE;
     }
@@ -110,13 +119,21 @@ static BOOLEAN VmxWriteGuestCr(UINT8 crNumber, UINT64 value)
  * VmExitHandler — chamado pelo AsmVmexitHandler a cada VM-exit.
  * Retorna 1 -> VMRESUME, 0 -> falha fatal, 2 -> sai do VMX via VMXOFF.
  * ------------------------------------------------------------------------- */
-UINT8 VmExitHandler(PGUEST_REGS regs)
+static UINT8 VmExitHandlerCore(
+    PGUEST_REGS regs,
+    UINT64 exitReason,
+    UINT64 exitQualification,
+    VMEXIT_FAILURE_CODE* failureCode)
 {
-    UINT64 exitReason = 0;
     UINT16 basicReason;
 
-    if (__vmx_vmread(VMCS_EXIT_REASON, &exitReason) != 0)
-        return FALSE;
+    /* VM-entry failures after guest-state loading are reported as VM-exits
+       with bit 31 set; they do not return through the VMLAUNCH failure path. */
+    if ((exitReason & (1ULL << 31)) != 0) {
+        *failureCode = VmexitFailureVmEntry;
+        return VMEXIT_RESULT_FATAL;
+    }
+
     basicReason = (UINT16)(exitReason & 0xFFFF);
 
     // 1. Handle the "Must Advance" exits (Instructions we spoofed)
@@ -151,8 +168,8 @@ UINT8 VmExitHandler(PGUEST_REGS regs)
             regs->rcx = (UINT32)out[2];
             regs->rdx = (UINT32)out[3];
         }
-        if (!VmxAdvanceGuestRip()) return FALSE;
-        return TRUE;
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
     }
 
 
@@ -161,8 +178,8 @@ UINT8 VmExitHandler(PGUEST_REGS regs)
         UINT64 value = __readmsr((ULONG)regs->rcx);
         regs->rax = (UINT32)value;
         regs->rdx = (UINT32)(value >> 32);
-        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
-        return TRUE;
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
 
     }
 
@@ -172,52 +189,48 @@ UINT8 VmExitHandler(PGUEST_REGS regs)
             __writemsr((ULONG)regs->rcx, (UINT64)(UINT32)regs->rax |
                 ((UINT64)(UINT32)regs->rdx << 32));
         }
-        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
-        return TRUE;
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
 
     }
 
     case EXIT_REASON_CR_ACCESS:
     {
-        UINT64 qualification = 0;
         UINT8 crNumber, accessType, regIndex;
         UINT64 value = 0;
 
-        if (__vmx_vmread(VMCS_EXIT_QUALIFICATION, &qualification) != 0)
-            return FALSE;
-
-        crNumber = (UINT8)(qualification & 0xF);
-        accessType = (UINT8)((qualification >> 4) & 0x3);
-        regIndex = (UINT8)((qualification >> 8) & 0xF);
+        crNumber = (UINT8)(exitQualification & 0xF);
+        accessType = (UINT8)((exitQualification >> 4) & 0x3);
+        regIndex = (UINT8)((exitQualification >> 8) & 0xF);
 
         if (accessType == 0) { /* MOV to CR */
             if (!VmxReadGuestGpr(regs, regIndex, &value) ||
                 !VmxWriteGuestCr(crNumber, value))
-                return FALSE;
+                { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
         } else if (accessType == 1) { /* MOV from CR */
             if (!VmxReadGuestCr(crNumber, &value) ||
                 !VmxWriteGuestGpr(regs, regIndex, value))
-                return FALSE;
+                { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
         } else if (accessType == 2 && crNumber == 0) { /* CLTS */
             if (!VmxReadGuestCr(0, &value) ||
                 !VmxWriteGuestCr(0, value & ~(1ULL << 3)))
-                return FALSE;
+                { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
         } else if (accessType == 3 && crNumber == 0) { /* LMSW */
-            UINT64 source = (qualification >> 16) & 0xFFFF;
+            UINT64 source = (exitQualification >> 16) & 0xFFFF;
             UINT64 oldValue;
             if (!VmxReadGuestCr(0, &value))
-                return FALSE;
+                { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
             oldValue = value;
             value = (value & ~0xFULL) | (source & 0xFULL);
             value |= oldValue & 1; /* LMSW cannot clear CR0.PE. */
             if (!VmxWriteGuestCr(0, value))
-                return FALSE;
+                { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
         } else {
-            return FALSE;
+            { *failureCode = VmexitFailureCrOperation; return VMEXIT_RESULT_FATAL; }
         }
 
-        if (!VmxAdvanceGuestRip()) return FALSE;
-        return TRUE;
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
     }
 
     case EXIT_REASON_VMXOFF:
@@ -229,13 +242,13 @@ UINT8 VmExitHandler(PGUEST_REGS regs)
             instructionLength == 0 ||
             __vmx_vmread(VMCS_GUEST_RSP, &g_VmxStopGuestRsp) != 0 ||
             __vmx_vmread(VMCS_GUEST_RFLAGS, &g_VmxStopGuestRflags) != 0)
-            return FALSE;
+            { *failureCode = VmexitFailureVmxoffState; return VMEXIT_RESULT_FATAL; }
 
         g_VmxStopGuestRip = guestRip + instructionLength;
 
         /* VMXOFF in non-root exits here; leave VMX before returning to caller. */
         __vmx_off();
-        return 2; /* assembly restores the interrupted guest context */
+        return VMEXIT_RESULT_VMXOFF; /* assembly restores the interrupted guest context */
     }
 
 
@@ -253,29 +266,135 @@ UINT8 VmExitHandler(PGUEST_REGS regs)
         }
         regs->rax = (UINT32)(tsc - 1000);
         regs->rdx = (UINT32)((tsc - 1000) >> 32);
-        if (!VmxAdvanceGuestRip()) return FALSE; // Stop if RIP cannot advance
-        return TRUE;
-        break;
+        if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+        return VMEXIT_RESULT_RESUME;
     }
 
     default:
         // DO NOT advance RIP here.
         // If we reach default, it's an exit we didn't expect.
         // Return FALSE so the assembly takes its fatal stop path.
-        return FALSE;
+        *failureCode = VmexitFailureUnknownReason;
+        return VMEXIT_RESULT_FATAL;
     }
 
-    return TRUE;
+    return VMEXIT_RESULT_RESUME;
+}
+
+UINT8 VmExitHandler(PGUEST_REGS regs, PVCPU vcpu)
+{
+    ULONG processorIndex;
+    PVMEXIT_DIAGNOSTICS diagnostics;
+    UINT64 exitReason = 0;
+    UINT8 result;
+    VMEXIT_FAILURE_CODE failureCode = VmexitFailureNone;
+
+    if (!vcpu)
+        return VMEXIT_RESULT_FATAL;
+
+    InterlockedExchange(&g_VmxProgressStage, HvLaunchTraceVmexitHandler);
+
+    processorIndex = vcpu->Diagnostics.ProcessorIndex;
+    diagnostics = &vcpu->Diagnostics;
+    InterlockedIncrement(&diagnostics->Sequence); /* odd: update in progress */
+    diagnostics->ProcessorIndex = processorIndex;
+    diagnostics->ExitReason = 0;
+    diagnostics->ExitQualification = 0;
+    diagnostics->GuestRip = 0;
+    diagnostics->GuestRsp = 0;
+    diagnostics->InstructionLength = 0;
+    diagnostics->VmInstructionError = 0;
+    diagnostics->VmInstructionErrorReadStatus = 0;
+    diagnostics->HandlerResult = MAXULONG;
+    diagnostics->FailureCode = VmexitFailureNone;
+    diagnostics->FailureStage = VmxFailureNone;
+    diagnostics->FailedVmcsField = 0;
+    diagnostics->VmxOperationStatus = 0;
+    diagnostics->FailureDetail = 0;
+
+    if (__vmx_vmread(VMCS_EXIT_REASON, &exitReason) != 0) {
+        failureCode = VmexitFailureReadExitReason;
+        result = VMEXIT_RESULT_FATAL;
+        goto done;
+    }
+    diagnostics->ExitReason = exitReason;
+
+    if (__vmx_vmread(VMCS_EXIT_QUALIFICATION, &diagnostics->ExitQualification) != 0) {
+        failureCode = VmexitFailureReadQualification;
+        result = VMEXIT_RESULT_FATAL;
+        goto done;
+    }
+
+    if (__vmx_vmread(VMCS_GUEST_RIP, &diagnostics->GuestRip) != 0 ||
+        __vmx_vmread(VMCS_GUEST_RSP, &diagnostics->GuestRsp) != 0 ||
+        __vmx_vmread(VMCS_VM_EXIT_INSTRUCTION_LEN, &diagnostics->InstructionLength) != 0) {
+        failureCode = VmexitFailureReadExitState;
+        result = VMEXIT_RESULT_FATAL;
+        goto done;
+    }
+
+    result = VmExitHandlerCore(regs, exitReason,
+        diagnostics->ExitQualification, &failureCode);
+
+done:
+    diagnostics->HandlerResult = result;
+    diagnostics->FailureCode = failureCode;
+    if (result == VMEXIT_RESULT_FATAL) {
+        if (failureCode == VmexitFailureVmEntry) {
+            diagnostics->FailureStage = VmxFailureVmEntryFailure;
+        } else {
+            diagnostics->FailureStage =
+                (failureCode == VmexitFailureReadExitReason ||
+                 failureCode == VmexitFailureReadExitState ||
+                 failureCode == VmexitFailureReadQualification)
+                    ? VmxFailureVmexitRead : VmxFailureVmexitHandler;
+        }
+        diagnostics->VmxOperationStatus = STATUS_UNSUCCESSFUL;
+    }
+    InterlockedIncrement(&diagnostics->Sequence); /* even: stable snapshot */
+    return result;
 }
 
 
 /* ---------------------------------------------------------------------------
  * VmResumeFailed — chamado pelo asm se VMRESUME falhar (não deveria ocorrer).
  * ------------------------------------------------------------------------- */
-VOID VmResumeFailed(void)
+VOID VmResumeFailed(PVCPU vcpu)
 {
     UINT64 err = 0;
-    __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &err);
-    DbgPrint("[Hvmx] VMRESUME falhou (VM-instruction-error=%llu)\n", err);
-    KeBugCheckEx(0x00001337, err, 0, 0, 0);
+    ULONG processorIndex = vcpu ? vcpu->Diagnostics.ProcessorIndex : MAXULONG;
+    int vmreadStatus;
+
+    vmreadStatus = __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &err);
+    if (vcpu) {
+        InterlockedIncrement(&vcpu->Diagnostics.Sequence);
+        vcpu->Diagnostics.FailureStage = VmxFailureVmresume;
+        vcpu->Diagnostics.VmInstructionError = err;
+        vcpu->Diagnostics.VmInstructionErrorReadStatus = vmreadStatus;
+        vcpu->Diagnostics.VmxOperationStatus = STATUS_UNSUCCESSFUL;
+        InterlockedIncrement(&vcpu->Diagnostics.Sequence);
+    }
+
+    /*
+     * Do not log here: VM-exit host RFLAGS have IF cleared, and this path may
+     * inherit an elevated guest IRQL. Keep the details in per-CPU diagnostics
+     * and bugcheck arguments so a debugger/dump can inspect them safely.
+     */
+    KeBugCheckEx(0x00001337, processorIndex, err,
+        vcpu ? vcpu->Diagnostics.ExitReason : 0,
+        vcpu ? vcpu->Diagnostics.GuestRip : 0);
+}
+
+VOID VmExitFatal(PVCPU vcpu)
+{
+    ULONG processorIndex = vcpu ? vcpu->Diagnostics.ProcessorIndex : MAXULONG;
+
+    if (vcpu) {
+        /* See VmResumeFailed: avoid debugger logging on the VM-exit path. */
+        KeBugCheckEx(0x00001338, processorIndex,
+            vcpu->Diagnostics.ExitReason, vcpu->Diagnostics.ExitQualification,
+            vcpu->Diagnostics.GuestRip);
+    }
+
+    KeBugCheckEx(0x00001338, processorIndex, 0, 0, 0);
 }
