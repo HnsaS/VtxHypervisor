@@ -1,99 +1,120 @@
 # VtxHypervisor
-hwid spoofer hypervisor
 
-A minimal, experimental type-2 kernel hypervisor for Windows x64 using Intel
-**VT-x**. The current diagnostic configuration intercepts **CPUID only** and
-does not implement EPT or general VM-exit emulation.
+VtxHypervisor is an experimental Windows x64 kernel driver that explores Intel
+VT-x virtualization of an already running Windows system (a type-2 design).
+It is a learning and debugging project, not a production hypervisor. It does
+not currently implement EPT, nested virtualization, or general VM-exit
+emulation.
 
-> Educational/research project. Requires an **Intel CPU with VT-x enabled in
-> the BIOS**. Startup refuses when CPUID reports an existing hypervisor; this
-> project has no nested-VMX support. Test in a nested VM only if nested VMX is
-> exposed and the detection check is deliberately adapted for that setup, or
-> on a dedicated machine with Hyper-V/VBS disabled.
+> **Stability:** this code can hang or crash the machine. Use a disposable test
+> system or a virtual machine with nested VMX enabled and a recoverable
+> snapshot. Do not test it on a machine containing data you cannot afford to
+> lose. Hyper-V/VBS and an already active hypervisor are unsupported.
 
-## Files
+## Current implementation
 
-| File | Contents |
+- Intel VT-x setup: `VMXON`, one VMCS per logical processor, and `VMLAUNCH`.
+- Logical processors are initialized serially while the startup thread is
+  pinned to each processor. All vCPU resources are allocated before the first
+  processor enters VMX operation.
+- The existing Windows kernel continues as the guest. VM-exit host state uses
+  the current Windows CR3, GDT, and IDT, with a per-vCPU VMM stack.
+- CPUID exits are handled. Leaf 0 reports the Intel vendor string; leaf 1
+  clears the hypervisor-present bit. Other CPUID leaves are passed through to
+  the processor.
+- VM-exit handling is intentionally incomplete. Unsupported exit reasons and
+  handler failures take a fatal path; interrupts, exceptions, EPT, and a
+  general event-injection framework are not implemented.
+- Startup progress is written to the driver's service registry key as
+  `LastStartProgress`. Assembly stages and a launch watchdog provide additional
+  in-memory diagnostics, but those volatile values do not survive a hard
+  freeze or forced reboot.
+
+This project is not a complete or stable hypervisor. In particular, a
+successful build does not prove that `VMLAUNCH` or the first VM-exit will work
+on a given CPU, firmware, or Windows configuration.
+
+## Source files
+
+| File | Responsibility |
 |---|---|
-| `driver.c` | `DriverEntry` / `DriverUnload`. |
-| `vmx.c` | VMX support, `VMXON`, VMCS setup, `VMLAUNCH`, and shutdown. |
-| `vmexit.c` | VM-exit handler. |
-| `asm.asm` | x64 stubs: `AsmVmxLaunch`, `AsmVmexitHandler`, and segment readers. |
-| `arch.h` | MSRs, VMCS encodings, control bits, and VM-exit reasons. |
-| `vmx.h` | Per-vCPU structures and prototypes. |
+| `driver.c` | WDM `DriverEntry`/unload routines, startup breadcrumbs, and launch watchdog. |
+| `vmx.c` | VT-x capability checks, VMXON/VMCS setup, per-CPU launch, and shutdown. |
+| `vmexit.c` | Supported VM-exit handling and failure diagnostics. |
+| `asm.asm` | MASM launch and VM-exit stubs, register save/restore, and segment helpers. |
+| `arch.h` | Intel MSR numbers, VMCS encodings, control bits, and exit reasons. |
+| `vmx.h` | Per-vCPU/global structures, progress stages, and C/assembly interfaces. |
 
-## How it works
+## Requirements
 
-1. `DriverEntry` calls `VmxInitializeAllProcessors()`, allocates every vCPU's
-   resources, and starts all logical processors through a synchronized DPC
-   broadcast.
-2. On each processor: `VMXON` → populate the VMCS (guest = current CPU state,
-   host = VMM) → `AsmVmxLaunch()` executes `VMLAUNCH`.
-3. On success, Windows continues as the guest. CPUID causes a VM-exit, is
-   emulated by `VmExitHandler`, and then returns through `VMRESUME`. Other
-   VM-exits are not currently implemented; the handler records the failure
-   context and stops through a bug check rather than retrying an unknown exit.
+- 64-bit Windows and an Intel processor that supports VT-x.
+- Intel Virtualization Technology (VT-x) enabled in firmware/BIOS.
+- Visual Studio with the Windows Driver Kit (WDK) matching the selected target
+  SDK, plus x64 MASM build support.
+- For a virtual-machine test, nested virtualization must be exposed to the
+  guest. This driver currently rejects CPUID configurations that report an
+  active hypervisor, so that check must be adapted deliberately for nested-VMX
+  testing.
+
+VT-d is not required by the current implementation because it does not use
+DMA remapping or EPT. Disabling Hyper-V/VBS may be necessary to ensure Windows
+does not already own VT-x. Firmware menus use different names; look for
+“Intel Virtualization Technology,” “Intel VT-x,” or a similar setting.
 
 ## Build
 
-Requires **Visual Studio + WDK** and **MASM** support.
+Open `VtxHypervisor.vcxproj` in Visual Studio, select **x64 / Debug** or
+**x64 / Release**, and build. The project includes `asm.asm` as a Microsoft
+Macro Assembler input.
 
-1. Open `VtxHypervisor.vcxproj` in Visual Studio (or create an *Empty WDM
-   Driver* project and add the files).
-2. `asm.asm` is already configured as a **Microsoft Macro Assembler** item in
-   the `.vcxproj`; MASM integration is supplied by the WDK.
-3. Select **x64 / Debug** or **Release**, then choose **Build**.
-4. Output: `x64\Debug\VtxHypervisor.sys`.
+The default output is:
 
-The **Debug** configuration is set not to sign the driver automatically. On
-Windows x64, the file needs a valid signature before it can be loaded; enabling
-`TESTSIGNING` by itself does not sign the `.sys` file.
-
-### Command line (EWDK)
-
-```bat
-msbuild VtxHypervisor.vcxproj /p:Configuration=Release /p:Platform=x64
+```text
+x64\Debug\VtxHypervisor.sys
 ```
 
-## Install / test (on a test machine!)
-
-Sign the `.sys` file with a test certificate and enable test signing on the test
-machine before loading it as a kernel service:
+Command-line build from a WDK-enabled Developer Command Prompt:
 
 ```bat
-bcdedit /set testsigning on
+msbuild VtxHypervisor.vcxproj /t:Rebuild /p:Configuration=Debug /p:Platform=x64
 ```
-(Restart.)
+
+The Debug configuration does not automatically sign the driver. Test-signing
+mode alone does not sign a `.sys` file; Windows still requires an acceptable
+test certificate and catalog/signing setup for the target machine.
+
+## Test setup
+
+Use an isolated test machine or VM. Before loading, arrange kernel debugging
+and crash-dump collection if available, and take a VM snapshot. Kernel
+virtualization failures can prevent normal system recovery.
+
+After signing the driver for the test machine, it can be registered as a
+kernel service from an elevated command prompt (replace the path as needed):
 
 ```bat
-sc create vtxhv type= kernel binPath= C:\path\VtxHypervisor.sys
-sc start vtxhv
+sc.exe create VtxHypervisor type= kernel binPath= "C:\path\VtxHypervisor.sys"
+sc.exe start VtxHypervisor
 ```
 
-Startup messages go to **DebugView** (enable *Capture Kernel*) or WinDbg.
-Fatal VM-exit details are recorded for kernel-dump analysis. To unload:
+To remove the service after it has been stopped:
 
 ```bat
-sc stop vtxhv
-sc delete vtxhv
+sc.exe stop VtxHypervisor
+sc.exe delete VtxHypervisor
 ```
 
-## What to modify
+Startup breadcrumbs are stored under the service key at
+`HKLM\SYSTEM\CurrentControlSet\Services\VtxHypervisor`, in the
+`LastStartProgress` value. The latest stage is written before entering
+`VMLAUNCH`; therefore `VMLAUNCH_BEGIN` alone does not prove whether the CPU
+executed or completed that instruction. Debug output can be viewed with
+WinDbg or a kernel-debug-output viewer. A hard freeze may leave no dump and
+does not guarantee that the watchdog can run.
 
-- **Intercept more events**: implement and validate the corresponding VM-exit
-  handler first, then add its control bit in `vmx.c`. Startup intentionally
-  rejects mandatory controls outside the currently implemented CPUID path.
-- **Handle a specific exit**: add a `case` to `VmExitHandler` (`vmexit.c`). The
-  exit reasons are in `arch.h`.
-- **Make a full driver (with a device/IOCTL)**: create `\Device\...` in
-  `driver.c`.
+## Extending the implementation
 
-## Warnings
-
-- VMXON/VMCS pages and all VMM stacks are allocated before any CPU enters VMX;
-  the stack uses non-executable nonpaged pool. VMX regions are kept below 4 GiB.
-- An invalid VMCS causes `VMLAUNCH` to fail with a *VM-instruction error*
-  (printed in the log). A failed `VMRESUME` intentionally triggers bug check
-  `0x1337`.
-- Always test in a VM/kernel-debug environment. A hypervisor bug can crash the
-  machine.
+Add and validate a VM-exit handler before enabling a control that can cause
+that exit. Unknown exits are fatal by design while the handler is incomplete.
+Keep VMX region formats, VMCS field encodings, register-save layout, and
+assembly/C structure offsets synchronized when changing the low-level path.
