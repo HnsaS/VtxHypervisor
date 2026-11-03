@@ -58,8 +58,8 @@
 #define EXIT_REASON_MSR_WRITE           32
 #define EXIT_REASON_VMXOFF              26
 #define EXIT_REASON_RDMSR               EXIT_REASON_MSR_READ
-#define EXIT_REASON_RDTSC               0x40
-#define EXIT_REASON_RDTSCP              0x41
+#define EXIT_REASON_RDTSC               16
+#define EXIT_REASON_RDTSCP              51
 
 /* ---------------------------------------------------------------------------
  * VMCS field encodings (Intel SDM Vol.3C Apêndice B)

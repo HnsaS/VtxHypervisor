@@ -29,6 +29,9 @@ VMM_VCPU_POINTER_OFFSET EQU 8
 VMEXIT_GUEST_REGS_SIZE  EQU 080h
 VMEXIT_SAVED_SIMD_SIZE  EQU 070h
 VMEXIT_VCPU_PTR_OFFSET  EQU VMEXIT_GUEST_REGS_SIZE + VMEXIT_SAVED_SIMD_SIZE + VMM_VCPU_POINTER_OFFSET
+VCPU_RUNTIME_VMEXIT_ACTIVE_OFFSET EQU 0A8h
+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET  EQU 0ACh
+VCPU_RUNTIME_VMEXIT_START_OFFSET  EQU 0B0h
 
 EXTERN VmExitHandler:PROC
 EXTERN VmResumeFailed:PROC
@@ -116,6 +119,18 @@ AsmVmxLaunch ENDP
 ;------------------------------------------------------------------------------
 AsmVmexitHandler PROC
     cli                         ; VM-exit clears IF architecturally; enforce it here too.
+    ; Mark this VCPU before saving state, so the runtime watchdog can detect
+    ; a stall in the assembly entry path as well as in the C handler.
+    push    rax
+    push    rcx
+    push    rdx
+    mov     rax, QWORD PTR [rsp+20h] ; original host RSP + pointer offset 8
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 3
+    mov     QWORD PTR [rax+VCPU_RUNTIME_VMEXIT_START_OFFSET], 0
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_ACTIVE_OFFSET], 1
+    pop     rdx
+    pop     rcx
+    pop     rax
     lock inc DWORD PTR [g_VmxVmexitCount]
     mov     DWORD PTR [g_VmxProgressStage], 3 ; HvLaunchTraceVmexitEntry
     push    r15
@@ -134,6 +149,8 @@ AsmVmexitHandler PROC
     push    rdx
     push    rcx
     push    rax
+    mov     rax, QWORD PTR [rsp+VMEXIT_GUEST_REGS_SIZE+VMM_VCPU_POINTER_OFFSET]
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 7
     mov     DWORD PTR [g_VmxProgressStage], 7 ; all GPRs saved
 
     ; Preserve volatile SIMD state because the guest can be interrupted
@@ -146,14 +163,19 @@ AsmVmexitHandler PROC
     movdqu  XMMWORD PTR [rsp+40h], xmm4
     movdqu  XMMWORD PTR [rsp+50h], xmm5
     stmxcsr DWORD PTR [rsp+60h]
+    mov     rax, QWORD PTR [rsp+VMEXIT_VCPU_PTR_OFFSET]
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 8
     mov     DWORD PTR [g_VmxProgressStage], 8 ; SIMD state saved
 
     lea     rcx, [rsp+VMEXIT_SAVED_SIMD_SIZE] ; arg1 = PGUEST_REGS
     mov     rdx, QWORD PTR [rsp+VMEXIT_VCPU_PTR_OFFSET] ; arg2 = PVCPU
+    mov     DWORD PTR [rdx+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 9
     mov     DWORD PTR [g_VmxProgressStage], 9 ; immediately before C handler
     sub     rsp, 20h            ; shadow space
     call    VmExitHandler
     add     rsp, 20h
+    mov     rax, QWORD PTR [rsp+VMEXIT_VCPU_PTR_OFFSET]
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 10
     mov     DWORD PTR [g_VmxProgressStage], 10 ; C handler returned
 
     cmp     al, 2
@@ -169,6 +191,12 @@ AsmVmexitHandler PROC
     add     rsp, VMEXIT_SAVED_SIMD_SIZE
     test    al, al
     jz      _StopVmx
+
+    ; The C/restore path completed. Clear the watchdog marker immediately
+    ; before VMRESUME so normal guest execution is never mistaken for a hang.
+    mov     rax, QWORD PTR [rsp+VMEXIT_GUEST_REGS_SIZE+VMM_VCPU_POINTER_OFFSET]
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 5
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_ACTIVE_OFFSET], 0
 
     pop     rax
     pop     rcx
@@ -220,6 +248,9 @@ _StopVmx:
 
 _LeaveVmx:
     cli
+    mov     rax, QWORD PTR [rsp+VMEXIT_VCPU_PTR_OFFSET]
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_STAGE_OFFSET], 11
+    mov     DWORD PTR [rax+VCPU_RUNTIME_VMEXIT_ACTIVE_OFFSET], 0
     movdqu  xmm0, XMMWORD PTR [rsp+00h]
     movdqu  xmm1, XMMWORD PTR [rsp+10h]
     movdqu  xmm2, XMMWORD PTR [rsp+20h]

@@ -452,6 +452,13 @@ UINT8 VmExitHandler(PGUEST_REGS regs, PVCPU vcpu)
     if (!vcpu)
         return VMEXIT_RESULT_FATAL;
 
+    /* Mark only the C VM-exit path. A separate periodic DPC checks this
+       timestamp so a handler that stops making progress can produce a dump. */
+    InterlockedExchange64(&vcpu->RuntimeVmExitStartTime,
+                          (LONG64)KeQueryInterruptTime());
+    InterlockedExchange(&vcpu->RuntimeVmExitActive, 1);
+    InterlockedExchange(&vcpu->RuntimeVmExitStage,
+                        HvLaunchTraceVmexitHandler);
     InterlockedExchange(&g_VmxProgressStage, HvLaunchTraceVmexitHandler);
 
     processorIndex = vcpu->Diagnostics.ProcessorIndex;
@@ -525,6 +532,9 @@ done:
         diagnostics->VmxOperationStatus = STATUS_UNSUCCESSFUL;
     }
     InterlockedIncrement(&diagnostics->Sequence); /* even: stable snapshot */
+
+    /* Assembly clears the marker immediately before VMRESUME. Fatal results
+       keep it set so the watchdog can catch a stalled fatal path too. */
     return result;
 }
 

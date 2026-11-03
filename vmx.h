@@ -70,6 +70,8 @@ extern volatile LONG g_VmxLaunchInProgress;
 extern volatile LONG64 g_VmxLaunchStartTime;
 VOID HvLaunchWatchdogStart(ULONG launchingProcessorIndex);
 VOID HvLaunchWatchdogStop(VOID);
+VOID HvRuntimeWatchdogStart(VOID);
+VOID HvRuntimeWatchdogStop(VOID);
 
 typedef enum _VMX_FAILURE_STAGE
 {
@@ -175,10 +177,21 @@ typedef struct _VCPU
 
     VMEXIT_DIAGNOSTICS Diagnostics;
 
+    /* Runtime watchdog state; assembly/C write it and per-CPU DPCs inspect it. */
+    volatile LONG RuntimeVmExitActive;
+    volatile LONG RuntimeVmExitStage;
+    DECLSPEC_ALIGN(8) volatile LONG64 RuntimeVmExitStartTime;
+    KTIMER RuntimeWatchdogTimer;
+    KDPC RuntimeWatchdogDpc;
+    BOOLEAN RuntimeWatchdogTimerInitialized;
+
     BOOLEAN ControlRegistersAdjusted;
     BOOLEAN VmxOnExecuted;       /* VMXON já executado neste core?           */
     BOOLEAN LaunchedOk;          /* VMLAUNCH bem-sucedido?                   */
 } VCPU, *PVCPU;
+C_ASSERT(FIELD_OFFSET(VCPU, RuntimeVmExitActive) == 0xA8);
+C_ASSERT(FIELD_OFFSET(VCPU, RuntimeVmExitStage) == 0xAC);
+C_ASSERT(FIELD_OFFSET(VCPU, RuntimeVmExitStartTime) == 0xB0);
 
 /* estado global do driver */
 typedef struct _HV_GLOBALS

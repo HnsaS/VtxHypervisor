@@ -19,6 +19,12 @@ static KDPC g_HvLaunchWatchdogDpc;
 static volatile LONG g_HvLaunchWatchdogBugcheckIssued;
 static volatile LONG g_HvLaunchWatchdogActive;
 static volatile LONG g_HvLaunchWatchdogInitialized;
+static volatile LONG g_HvRuntimeWatchdogActive;
+static volatile LONG g_HvRuntimeWatchdogBugcheckIssued;
+
+#define HV_RUNTIME_WATCHDOG_PERIOD_MS       250
+#define HV_RUNTIME_VMEXIT_TIMEOUT_100NS     (2LL * 1000LL * 1000LL * 10LL)
+#define HV_BUGCHECK_RUNTIME_VMEXIT_STALLED  0x00001339
 
 static PCWSTR HvProgressStageName(HV_PROGRESS_STAGE stage)
 {
@@ -141,8 +147,139 @@ VOID HvLaunchWatchdogStop(VOID)
     }
 }
 
+static VOID HvRuntimeWatchdogDpcRoutine(
+    PKDPC dpc,
+    PVOID deferredContext,
+    PVOID systemArgument1,
+    PVOID systemArgument2)
+{
+    ULONG i;
+    ULONG64 now;
+
+    UNREFERENCED_PARAMETER(dpc);
+    UNREFERENCED_PARAMETER(deferredContext);
+    UNREFERENCED_PARAMETER(systemArgument1);
+    UNREFERENCED_PARAMETER(systemArgument2);
+
+    if (InterlockedCompareExchange(&g_HvRuntimeWatchdogActive, 0, 0) == 0 ||
+        !g_Hv.VcpuArray)
+        return;
+
+    now = KeQueryInterruptTime();
+    for (i = 0; i < g_Hv.ProcessorCount; ++i)
+    {
+        PVCPU vcpu = &g_Hv.VcpuArray[i];
+        LONG active = InterlockedCompareExchange(&vcpu->RuntimeVmExitActive,
+                                                  0, 0);
+        LONG64 startTime;
+
+        if (active == 0)
+            continue;
+
+        startTime = InterlockedCompareExchange64(
+            &vcpu->RuntimeVmExitStartTime, 0, 0);
+        if (startTime == 0)
+        {
+            /* The assembly entry marks the VCPU before C can take a timestamp. */
+            InterlockedCompareExchange64(&vcpu->RuntimeVmExitStartTime,
+                                         (LONG64)now, 0);
+            continue;
+        }
+        if (startTime < 0 || now < (ULONG64)startTime ||
+            now - (ULONG64)startTime < HV_RUNTIME_VMEXIT_TIMEOUT_100NS)
+            continue;
+
+        if (InterlockedCompareExchange(&g_HvRuntimeWatchdogBugcheckIssued,
+                                       1, 0) == 0)
+        {
+            /* 0x1339: VM-exit path remained active for two seconds.
+               Arguments: CPU, assembly/C stage, exit reason, guest RIP. */
+            KeBugCheckEx(HV_BUGCHECK_RUNTIME_VMEXIT_STALLED,
+                vcpu->Diagnostics.ProcessorIndex,
+                (ULONG_PTR)InterlockedCompareExchange(
+                    &vcpu->RuntimeVmExitStage, 0, 0),
+                (ULONG_PTR)vcpu->Diagnostics.ExitReason,
+                (ULONG_PTR)vcpu->Diagnostics.GuestRip);
+        }
+        return;
+    }
+}
+
+VOID HvRuntimeWatchdogStart(VOID)
+{
+    ULONG i;
+    ULONG started = 0;
+    LARGE_INTEGER dueTime;
+
+    if (!g_Hv.VcpuArray || g_Hv.ProcessorCount == 0 ||
+        InterlockedCompareExchange(&g_HvRuntimeWatchdogActive, 1, 0) != 0)
+        return;
+
+    InterlockedExchange(&g_HvRuntimeWatchdogBugcheckIssued, 0);
+    dueTime.QuadPart = -((LONGLONG)HV_RUNTIME_WATCHDOG_PERIOD_MS * 10000LL);
+
+    for (i = 0; i < g_Hv.ProcessorCount; ++i)
+    {
+        PVCPU vcpu = &g_Hv.VcpuArray[i];
+        PROCESSOR_NUMBER processorNumber;
+        NTSTATUS status;
+
+        if (!vcpu->RuntimeWatchdogTimerInitialized)
+        {
+            KeInitializeTimerEx(&vcpu->RuntimeWatchdogTimer,
+                                NotificationTimer);
+            KeInitializeDpc(&vcpu->RuntimeWatchdogDpc,
+                            HvRuntimeWatchdogDpcRoutine, vcpu);
+            vcpu->RuntimeWatchdogTimerInitialized = TRUE;
+        }
+
+        if (!NT_SUCCESS(KeGetProcessorNumberFromIndex(i, &processorNumber)))
+            continue;
+
+        status = KeSetTargetProcessorDpcEx(&vcpu->RuntimeWatchdogDpc,
+                                           &processorNumber);
+        if (!NT_SUCCESS(status))
+            continue;
+
+        KeSetTimerEx(&vcpu->RuntimeWatchdogTimer, dueTime,
+                     HV_RUNTIME_WATCHDOG_PERIOD_MS,
+                     &vcpu->RuntimeWatchdogDpc);
+        ++started;
+    }
+
+    if (started == 0)
+        InterlockedExchange(&g_HvRuntimeWatchdogActive, 0);
+}
+
+VOID HvRuntimeWatchdogStop(VOID)
+{
+    ULONG i;
+
+    if (InterlockedExchange(&g_HvRuntimeWatchdogActive, 0) == 0)
+        return;
+
+    if (g_Hv.VcpuArray)
+    {
+        for (i = 0; i < g_Hv.ProcessorCount; ++i)
+        {
+            PVCPU vcpu = &g_Hv.VcpuArray[i];
+            if (vcpu->RuntimeWatchdogTimerInitialized)
+                KeCancelTimer(&vcpu->RuntimeWatchdogTimer);
+        }
+    }
+
+    /* Ensure no watchdog DPC can still access VCPU state before it is freed. */
+    KeFlushQueuedDpcs();
+}
+
 VOID HvProgressOpen(PUNICODE_STRING serviceRegistryPath)
 {
+
+    if (serviceRegistryPath == NULL || serviceRegistryPath->Buffer == NULL) {
+        DbgPrint("[Hvmx] No registry path provided; skipping progress logging.\n");
+        return;
+    }
+
     OBJECT_ATTRIBUTES attributes;
     NTSTATUS status;
 
@@ -250,33 +387,50 @@ static VOID VmxWriteStartErrorLog(PDRIVER_OBJECT driverObject, NTSTATUS status)
     IoWriteErrorLogEntry(packet);
 }
 
+// Change the signature so it doesn't require a PDRIVER_OBJECT
+VOID ShutdownHypervisor()
+{
+    HvRuntimeWatchdogStop();
+    VmxShutdownAllProcessors();
+    HvProgressClose();
+    DbgPrint("[Hvmx] hypervisor descarregado manualmente.\n");
+}
+
 VOID DriverUnload(PDRIVER_OBJECT driverObject)
 {
     UNREFERENCED_PARAMETER(driverObject);
+    HvRuntimeWatchdogStop();
     VmxShutdownAllProcessors();
     HvProgressClose();
     DbgPrint("[Hvmx] driver descarregado.\n");
 }
+// driver.c
 
-NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
+// driver.c
+
+// 1. Move all your actual logic here
+// 1. FIXED: Now accepts both parameters so it can use driverObject for logging
+NTSTATUS InitializeHypervisor(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
     NTSTATUS status;
 
-    DbgPrint("[Hvmx] DriverEntry: iniciando hypervisor VT-x...\n");
+    DbgPrint("[Hvmx] Iniciando hypervisor VT-x...\n");
 
+    // HvProgressOpen must be written to handle NULL registryPath safely
     HvProgressOpen(registryPath);
     HvProgressWrite(MAXULONG, HvProgressDriverEntry, STATUS_SUCCESS);
 
-    driverObject->DriverUnload = DriverUnload;
-
     status = VmxInitializeAllProcessors();
     HvLaunchWatchdogStop();
+
     if (!NT_SUCCESS(status))
     {
         HvProgressWrite(g_Hv.FailedProcessorIndex,
             HvProgressInitializationFailed, status);
+
         DbgPrint("[Hvmx] falha ao inicializar VT-x (0x%08X, cpu=%lu).\n",
-                 status, g_Hv.FailedProcessorIndex);
+            status, g_Hv.FailedProcessorIndex);
+
         if (g_Hv.VcpuArray && g_Hv.FailedProcessorIndex < g_Hv.ProcessorCount)
         {
             PVMEXIT_DIAGNOSTICS diagnostics =
@@ -286,13 +440,49 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
                 diagnostics->FailedVmcsField, diagnostics->VmxOperationStatus,
                 diagnostics->VmInstructionError, diagnostics->VmInstructionErrorReadStatus);
         }
-        VmxWriteStartErrorLog(driverObject, status);
+
+        // FIXED: driverObject is now a parameter, so this is now valid
+        if (driverObject != NULL) {
+            VmxWriteStartErrorLog(driverObject, status);
+        }
+
         VmxShutdownAllProcessors();
         HvProgressClose();
         return status;
     }
 
+    HvRuntimeWatchdogStart();
     HvProgressWrite(MAXULONG, HvProgressInitializationComplete, STATUS_SUCCESS);
     DbgPrint("[Hvmx] hypervisor ativo em %lu core(s).\n", g_Hv.ProcessorCount);
     return STATUS_SUCCESS;
 }
+
+// 2. FIXED: Signature matches what kdmapper expects
+NTSTATUS CustomDriverEntry(PDRIVER_OBJECT kdmapperParam1, PUNICODE_STRING kdmapperParam2)
+{
+    UNREFERENCED_PARAMETER(kdmapperParam1);
+    UNREFERENCED_PARAMETER(kdmapperParam2);
+
+    // FIXED: Pass NULL for both because we are manually mapped
+    return InitializeHypervisor(NULL, NULL);
+}
+
+// 3. FIXED: Pass arguments to CustomDriverEntry to avoid C2198
+NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
+{
+    if (driverObject == NULL)
+    {
+        // FIXED: Added NULL, NULL to match the signature of CustomDriverEntry
+        return CustomDriverEntry(NULL, NULL);
+    }
+
+    driverObject->DriverUnload = DriverUnload;
+
+    // FIXED: Now correctly passes both arguments
+    return InitializeHypervisor(driverObject, registryPath);
+}
+
+
+
+// Keep the original DriverEntry for standard loading,
+// but kdmapper will be configured to call CustomDriverEntry.
