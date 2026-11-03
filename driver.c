@@ -457,32 +457,19 @@ NTSTATUS InitializeHypervisor(PDRIVER_OBJECT driverObject, PUNICODE_STRING regis
     return STATUS_SUCCESS;
 }
 
-// 2. FIXED: Signature matches what kdmapper expects
-NTSTATUS CustomDriverEntry(PDRIVER_OBJECT kdmapperParam1, PUNICODE_STRING kdmapperParam2)
-{
-    UNREFERENCED_PARAMETER(kdmapperParam1);
-    UNREFERENCED_PARAMETER(kdmapperParam2);
-
-    // FIXED: Pass NULL for both because we are manually mapped
-    return InitializeHypervisor(NULL, NULL);
-}
-
-// 3. FIXED: Pass arguments to CustomDriverEntry to avoid C2198
+// Standard driver entry point.
+// KDMapper typically passes (ImageBase, ImageSize) — NOT a real DRIVER_OBJECT.
+// We validate using the Type field that every genuine DRIVER_OBJECT carries
+// (IO_TYPE_DRIVER == 4), so this works regardless of what the mapper passes.
 NTSTATUS DriverEntry(PDRIVER_OBJECT driverObject, PUNICODE_STRING registryPath)
 {
-    if (driverObject == NULL)
+    if (driverObject == NULL ||
+        driverObject->Type != IO_TYPE_DRIVER)   /* 0x0004 */
     {
-        // FIXED: Added NULL, NULL to match the signature of CustomDriverEntry
-        return CustomDriverEntry(NULL, NULL);
+        // Manual-mapped (KDMapper) or invalid context — go NULL-safe path
+        return InitializeHypervisor(NULL, NULL);
     }
 
     driverObject->DriverUnload = DriverUnload;
-
-    // FIXED: Now correctly passes both arguments
     return InitializeHypervisor(driverObject, registryPath);
 }
-
-
-
-// Keep the original DriverEntry for standard loading,
-// but kdmapper will be configured to call CustomDriverEntry.
