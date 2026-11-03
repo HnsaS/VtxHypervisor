@@ -33,6 +33,16 @@ static PCWSTR HvProgressStageName(HV_PROGRESS_STAGE stage)
     case HvProgressCpuComplete: return L"CPU_COMPLETE";
     case HvProgressInitializationFailed: return L"INITIALIZATION_FAILED";
     case HvProgressInitializationComplete: return L"INITIALIZATION_COMPLETE";
+    case HvProgressVmwriteRflagsBegin: return L"VMWRITE_RFLAGS_BEGIN";
+    case HvProgressVmwriteRflagsDone: return L"VMWRITE_RFLAGS_DONE";
+    case HvProgressVmwriteRspBegin: return L"VMWRITE_GUEST_RSP_BEGIN";
+    case HvProgressVmwriteRspDone: return L"VMWRITE_GUEST_RSP_DONE";
+    case HvProgressVmwriteRipBegin: return L"VMWRITE_GUEST_RIP_BEGIN";
+    case HvProgressVmwriteRipDone: return L"VMWRITE_GUEST_RIP_DONE";
+    case HvProgressVmlaunchInstruction: return L"VMLAUNCH_INSTRUCTION";
+    case HvProgressVmwriteRflagsFailed: return L"VMWRITE_RFLAGS_FAILED";
+    case HvProgressVmwriteRspFailed: return L"VMWRITE_GUEST_RSP_FAILED";
+    case HvProgressVmwriteRipFailed: return L"VMWRITE_GUEST_RIP_FAILED";
     default: return L"UNKNOWN";
     }
 }
@@ -173,6 +183,18 @@ VOID HvProgressWrite(ULONG processorIndex, HV_PROGRESS_STAGE stage, NTSTATUS sta
         /* Force the breadcrumb to the SYSTEM hive before entering VMX. */
         (VOID)ZwFlushKey(g_HvProgressKey);
     }
+}
+
+/* Called only by AsmVmxLaunch before entering VMX non-root. That path is
+   still at PASSIVE_LEVEL, so the registry breadcrumb can be flushed safely. */
+VOID HvProgressWriteLaunchStage(ULONG stage)
+{
+    LONG processorIndex = InterlockedCompareExchange(&g_VmxProgressProcessor,
+                                                      -1, -1);
+
+    if (processorIndex >= 0)
+        HvProgressWrite((ULONG)processorIndex, (HV_PROGRESS_STAGE)stage,
+                        STATUS_SUCCESS);
 }
 
 VOID HvProgressClose(VOID)

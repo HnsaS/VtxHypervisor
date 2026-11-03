@@ -391,6 +391,7 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
             (((__readmsr(primaryMsr) >> 32) &
               CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) != 0);
         UINT32 requiredControls = CPU_BASED_USE_MSR_BITMAPS |
+            CPU_BASED_RDTSC_EXITING |
             (haveSecondary ? CPU_BASED_ACTIVATE_SECONDARY_CONTROLS : 0);
         UINT32 permittedControls = requiredControls | CPU_BASED_DEFAULT1_CONTROLS;
         UINT32 primaryControls = VmxAdjustControls(requiredControls, primaryMsr);
@@ -428,6 +429,7 @@ static NTSTATUS VmxSetupVmcs(PVCPU vcpu)
                 vcpu->Diagnostics.VmxOperationStatus = STATUS_NOT_SUPPORTED;
                 return STATUS_NOT_SUPPORTED;
             }
+            vcpu->SecondaryControls = secondaryControls;
             VMWRITE(VMCS_SECONDARY_VM_EXEC_CONTROL, secondaryControls);
             if (secondaryControls & SECONDARY_EXEC_ENABLE_XSAVES)
                 VMWRITE(VMCS_XSS_EXITING_BITMAP, 0); /* never exit on XSAVES */
@@ -607,6 +609,17 @@ NTSTATUS VmxInitializeAllProcessors(void)
             vcpu->Diagnostics.FailureStage = VmxFailureAllocation;
             vcpu->Diagnostics.VmxOperationStatus = STATUS_INSUFFICIENT_RESOURCES;
             return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        {
+            const ULONG msrIndex = 0x80;
+            const ULONG byteIndex = msrIndex >> 3;
+            const UCHAR bitMask = (UCHAR)(1U << (msrIndex & 7));
+            PUCHAR msrBitmap = (PUCHAR)vcpu->MsrBitmap;
+
+            /* Intercept the test MSR 0x80 for reads and writes only. */
+            msrBitmap[byteIndex] |= bitMask;
+            msrBitmap[(PAGE_SIZE / 2) + byteIndex] |= bitMask;
         }
     }
 

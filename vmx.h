@@ -26,8 +26,21 @@ typedef enum _HV_PROGRESS_STAGE
     HvProgressVmlaunchReturned,
     HvProgressCpuComplete,
     HvProgressInitializationFailed,
-    HvProgressInitializationComplete
+    HvProgressInitializationComplete,
+    HvProgressVmwriteRflagsBegin,
+    HvProgressVmwriteRflagsDone,
+    HvProgressVmwriteRspBegin,
+    HvProgressVmwriteRspDone,
+    HvProgressVmwriteRipBegin,
+    HvProgressVmwriteRipDone,
+    HvProgressVmlaunchInstruction,
+    HvProgressVmwriteRflagsFailed,
+    HvProgressVmwriteRspFailed,
+    HvProgressVmwriteRipFailed
 } HV_PROGRESS_STAGE;
+C_ASSERT(HvProgressVmwriteRflagsBegin == 10);
+C_ASSERT(HvProgressVmlaunchInstruction == 16);
+C_ASSERT(HvProgressVmwriteRipFailed == 19);
 
 /* Volatile breadcrumbs used by the launch watchdog and assembly stubs. */
 typedef enum _HV_LAUNCH_TRACE_STAGE
@@ -47,6 +60,7 @@ typedef enum _HV_LAUNCH_TRACE_STAGE
 
 VOID HvProgressOpen(PUNICODE_STRING serviceRegistryPath);
 VOID HvProgressWrite(ULONG processorIndex, HV_PROGRESS_STAGE stage, NTSTATUS status);
+VOID HvProgressWriteLaunchStage(ULONG stage);
 VOID HvProgressClose(VOID);
 
 extern volatile LONG g_VmxProgressStage;
@@ -157,6 +171,7 @@ typedef struct _VCPU
     PVOID  VmmStack;             /* base da pilha do host (VMM)              */
     UINT64 OriginalCr0;
     UINT64 OriginalCr4;
+    UINT32 SecondaryControls;
 
     VMEXIT_DIAGNOSTICS Diagnostics;
 

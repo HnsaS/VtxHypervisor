@@ -187,6 +187,7 @@ static BOOLEAN VmxWriteGuestCr(UINT8 crNumber, UINT64 value)
  * ------------------------------------------------------------------------- */
 static UINT8 VmExitHandlerCore(
     PGUEST_REGS regs,
+    PVCPU vcpu,
     UINT64 exitReason,
     UINT64 exitQualification,
     VMEXIT_FAILURE_CODE* failureCode)
@@ -207,36 +208,62 @@ static UINT8 VmExitHandlerCore(
     {
     case EXIT_REASON_CPUID:
     {
-        /* CPUID only looks at EAX; upper RAX bits are don't-care. */
-        regs->rax = (UINT32)regs->rax;
-        regs->rcx = (UINT32)regs->rcx;
-        if (regs->rax == 0) {
-            int out[4];
-            __cpuidex(out, 0, 0);
-            regs->rax = (UINT32)out[0];
-            // GenuineIntel vendor string is returned in EBX, EDX, ECX order.
-            regs->rbx = 0x756e4547; // "GenU"
-            regs->rdx = 0x49656e69; // "ineI"
-            regs->rcx = 0x6c65746e; // "ntel"
+        UINT32 leaf = (UINT32)regs->rax;
+        UINT32 subleaf = (UINT32)regs->rcx;
+        int out[4];
+        static const UCHAR brandPrefix[] = "Intel(R) Core(TM) i7";
+
+        /* Start with the native CPUID response and override only selected
+           values. CPUID results are 32-bit, even though GPRs are 64-bit. */
+        __cpuidex(out, (int)leaf, (int)subleaf);
+        regs->rax = (UINT32)out[0];
+        regs->rbx = (UINT32)out[1];
+        regs->rcx = (UINT32)out[2];
+        regs->rdx = (UINT32)out[3];
+
+        if (leaf == 0)
+        {
+            /* Vendor is returned in EBX, EDX, ECX order. */
+            regs->rbx = 0x756e6547; /* "Genu" */
+            regs->rdx = 0x49656e69; /* "ineI" */
+            regs->rcx = 0x6c65746e; /* "ntel" */
         }
-        else if (regs->rax == 1) {
-            int out[4];
-            __cpuidex(out, (int)regs->rax, (int)regs->rcx);
-            regs->rax = (UINT32)out[0];
-            regs->rbx = (UINT32)out[1];
-            regs->rcx = (UINT32)out[2];
-            regs->rdx = (UINT32)out[3];
-            // Mask out the Hypervisor Present bit to hide the VM
-            regs->rcx &= ~(1ULL << 31);
+        else if (leaf >= 0x80000002 && leaf <= 0x80000004)
+        {
+            UCHAR brand[48];
+            UINT32 words[12];
+            UINT32 wordIndex = (leaf - 0x80000002) * 4;
+
+            RtlFillMemory(brand, sizeof(brand), ' ');
+            RtlCopyMemory(brand, brandPrefix, sizeof(brandPrefix) - 1);
+            RtlCopyMemory(words, brand, sizeof(brand));
+            regs->rax = words[wordIndex + 0];
+            regs->rbx = words[wordIndex + 1];
+            regs->rcx = words[wordIndex + 2];
+            regs->rdx = words[wordIndex + 3];
         }
-        else {
-            int out[4];
-            __cpuidex(out, (int)regs->rax, (int)regs->rcx);
-            regs->rax = (UINT32)out[0];
-            regs->rbx = (UINT32)out[1];
-            regs->rcx = (UINT32)out[2];
-            regs->rdx = (UINT32)out[3];
+
+        /* Don't advertise execution features unavailable in the VMCS. */
+        if (leaf == 1)
+            regs->rcx &= ~((1U << 5) | (1U << 6) | (1U << 31));
+        else if (leaf == 7 && subleaf == 0)
+        {
+            if ((vcpu->SecondaryControls & SECONDARY_EXEC_ENABLE_INVPCID) == 0)
+                regs->rbx &= ~(1U << 10);
+            if ((vcpu->SecondaryControls & SECONDARY_EXEC_ENABLE_USER_WAIT_PAUSE) == 0)
+                regs->rcx &= ~(1U << 5);
         }
+        else if (leaf == 0x0D && subleaf == 1 &&
+                 (vcpu->SecondaryControls & SECONDARY_EXEC_ENABLE_XSAVES) == 0)
+        {
+            regs->rax &= ~(1U << 3); /* XSAVES/XRSTORS */
+            regs->rcx = 0;
+            regs->rdx = 0;
+        }
+        else if (leaf == 0x80000001 &&
+                 (vcpu->SecondaryControls & SECONDARY_EXEC_ENABLE_RDTSCP) == 0)
+            regs->rdx &= ~(1U << 27);
+
         if (!VmxAdvanceGuestRip()) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
         return VMEXIT_RESULT_RESUME;
     }
@@ -245,6 +272,12 @@ static UINT8 VmExitHandlerCore(
     case EXIT_REASON_MSR_READ:
     {
         UINT64 value;
+        /* Test index 0x80 is reserved and is intentionally reflected as #GP;
+           never execute RDMSR for it in VMX root mode. */
+        if ((UINT32)regs->rcx == 0x80) {
+            if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+            return VMEXIT_RESULT_RESUME;
+        }
         /* An invalid MSR in root mode would #GP inside the VMM (on a pool
            stack, IF=0) and wedge the box. Reflect the #GP to the guest. */
         if (!VmxMsrIndexInArchitecturalRange((UINT32)regs->rcx)) {
@@ -261,6 +294,10 @@ static UINT8 VmExitHandlerCore(
 
     case EXIT_REASON_MSR_WRITE:
     {
+        if ((UINT32)regs->rcx == 0x80) {
+            if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
+            return VMEXIT_RESULT_RESUME;
+        }
         if (!VmxMsrIndexInArchitecturalRange((UINT32)regs->rcx)) {
             if (!VmxInjectException(13, TRUE, 0)) { *failureCode = VmexitFailureAdvanceRip; return VMEXIT_RESULT_FATAL; }
             return VMEXIT_RESULT_RESUME;
@@ -464,7 +501,7 @@ UINT8 VmExitHandler(PGUEST_REGS regs, PVCPU vcpu)
                   diagnostics->ExitQualification, diagnostics->GuestRip);
 #endif
 
-    result = VmExitHandlerCore(regs, exitReason,
+    result = VmExitHandlerCore(regs, vcpu, exitReason,
         diagnostics->ExitQualification, &failureCode);
 
 done:

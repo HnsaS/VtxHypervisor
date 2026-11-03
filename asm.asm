@@ -15,6 +15,16 @@ OPTION CASEMAP:NONE
 VMCS_GUEST_RSP          EQU 0681Ch
 VMCS_GUEST_RIP          EQU 0681Eh
 VMCS_GUEST_RFLAGS       EQU 06820h
+HV_PROGRESS_VMWRITE_RFLAGS_BEGIN EQU 10
+HV_PROGRESS_VMWRITE_RFLAGS_DONE  EQU 11
+HV_PROGRESS_VMWRITE_RSP_BEGIN    EQU 12
+HV_PROGRESS_VMWRITE_RSP_DONE     EQU 13
+HV_PROGRESS_VMWRITE_RIP_BEGIN    EQU 14
+HV_PROGRESS_VMWRITE_RIP_DONE     EQU 15
+HV_PROGRESS_VMLAUNCH_INSTRUCTION EQU 16
+HV_PROGRESS_VMWRITE_RFLAGS_FAILED EQU 17
+HV_PROGRESS_VMWRITE_RSP_FAILED    EQU 18
+HV_PROGRESS_VMWRITE_RIP_FAILED    EQU 19
 VMM_VCPU_POINTER_OFFSET EQU 8
 VMEXIT_GUEST_REGS_SIZE  EQU 080h
 VMEXIT_SAVED_SIMD_SIZE  EQU 070h
@@ -23,11 +33,19 @@ VMEXIT_VCPU_PTR_OFFSET  EQU VMEXIT_GUEST_REGS_SIZE + VMEXIT_SAVED_SIMD_SIZE + VM
 EXTERN VmExitHandler:PROC
 EXTERN VmResumeFailed:PROC
 EXTERN VmExitFatal:PROC
+EXTERN HvProgressWriteLaunchStage:PROC
 EXTERN g_VmxProgressStage:DWORD
 EXTERN g_VmxVmexitCount:DWORD
 EXTERN g_VmxStopGuestRip:QWORD
 EXTERN g_VmxStopGuestRsp:QWORD
 EXTERN g_VmxStopGuestRflags:QWORD
+
+WRITE_LAUNCH_PROGRESS MACRO stage
+    mov     ecx, stage
+    sub     rsp, 28h            ; shadow space + 16-byte call-site alignment
+    call    HvProgressWriteLaunchStage
+    add     rsp, 28h
+ENDM
 
 .CODE
 
@@ -40,24 +58,29 @@ EXTERN g_VmxStopGuestRflags:QWORD
 ;     retorna TRUE (rax=1) ao chamador, agora em VMX non-root (guest).
 ;------------------------------------------------------------------------------
 AsmVmxLaunch PROC
-    ; RFLAGS was previously captured while building the VMCS, before registry
-    ; I/O and other calls. Capture it at the actual launch boundary so guest
-    ; IF/flags match the current kernel context.
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RFLAGS_BEGIN
     pushfq
     pop     rax
     mov     rcx, VMCS_GUEST_RFLAGS
     vmwrite rcx, rax
-    jbe     _VmxLaunchPrepFailed  ; VMfailValid/Invalid: return to C safely
+    jbe     _VmxWriteRflagsFailed ; VMfailValid/Invalid: return to C safely
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RFLAGS_DONE
 
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RSP_BEGIN
     mov     rdx, rsp            ; GUEST_RSP = rsp atual
     mov     rcx, VMCS_GUEST_RSP
     vmwrite rcx, rdx
-    jbe     _VmxLaunchPrepFailed
+    jbe     _VmxWriteRspFailed
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RSP_DONE
 
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RIP_BEGIN
     mov     rcx, VMCS_GUEST_RIP
     lea     rdx, _GuestResume   ; GUEST_RIP = _GuestResume
     vmwrite rcx, rdx
-    jbe     _VmxLaunchPrepFailed
+    jbe     _VmxWriteRipFailed
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RIP_DONE
+
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMLAUNCH_INSTRUCTION
 
     vmlaunch
 
@@ -65,6 +88,16 @@ AsmVmxLaunch PROC
 _VmxLaunchPrepFailed:
     xor     rax, rax            ; FALSE
     ret
+
+_VmxWriteRflagsFailed:
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RFLAGS_FAILED
+    jmp     _VmxLaunchPrepFailed
+_VmxWriteRspFailed:
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RSP_FAILED
+    jmp     _VmxLaunchPrepFailed
+_VmxWriteRipFailed:
+    WRITE_LAUNCH_PROGRESS HV_PROGRESS_VMWRITE_RIP_FAILED
+    jmp     _VmxLaunchPrepFailed
 
 _GuestResume:
     ; ---- guest começa a executar aqui (modo non-root) ----

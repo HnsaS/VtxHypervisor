@@ -174,6 +174,7 @@
  * Bits de controle usados
  * ------------------------------------------------------------------------- */
 #define CPU_BASED_ACTIVATE_SECONDARY_CONTROLS (1UL << 31)
+#define CPU_BASED_RDTSC_EXITING                (1UL << 12)
 #define CPU_BASED_CR3_LOAD_EXITING             (1UL << 15)
 #define CPU_BASED_CR3_STORE_EXITING            (1UL << 16)
 #define CPU_BASED_USE_MSR_BITMAPS               (1UL << 28)
